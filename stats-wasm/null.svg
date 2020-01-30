@@ -1,0 +1,2328 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="982" onload="init(evt)" viewBox="0 0 1200 982" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+	}
+
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+		}
+		else if (e.target.id == "unzoom") unzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+	}, false)
+
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+		return;
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) {
+				currentSearchTerm = term;
+				search();
+			}
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (currentSearchTerm === null) return;
+		var term = currentSearchTerm;
+
+		var re = new RegExp(term, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="982.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="965" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="965" > </text>
+<g id="frames">
+<g >
+<title>pthread_self@GLIBC_2.2.5 (1 samples, 0.46%)</title><rect x="179.4" y="805" width="5.4" height="15.0" fill="rgb(221,62,25)" rx="2" ry="2" />
+<text  x="182.35" y="815.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::getHeaderMapValue (1 samples, 0.46%)</title><rect x="283.1" y="677" width="5.5" height="15.0" fill="rgb(242,200,48)" rx="2" ry="2" />
+<text  x="286.15" y="687.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Exports::remove_header_map_value (1 samples, 0.46%)</title><rect x="927.8" y="549" width="5.4" height="15.0" fill="rgb(234,53,43)" rx="2" ry="2" />
+<text  x="930.78" y="559.5" ></text>
+</g>
+<g >
+<title>SSL_get_peer_certificate (2 samples, 0.93%)</title><rect x="288.6" y="613" width="10.9" height="15.0" fill="rgb(244,227,37)" rx="2" ry="2" />
+<text  x="291.61" y="623.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::HeaderMapImpl::maybeCreateInline (1 samples, 0.46%)</title><rect x="1026.1" y="581" width="5.5" height="15.0" fill="rgb(254,81,43)" rx="2" ry="2" />
+<text  x="1029.11" y="591.5" ></text>
+</g>
+<g >
+<title>sk_num (1 samples, 0.46%)</title><rect x="1020.6" y="533" width="5.5" height="15.0" fill="rgb(242,33,37)" rx="2" ry="2" />
+<text  x="1023.65" y="543.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::doDeferredStreamDestroy (2 samples, 0.93%)</title><rect x="512.6" y="549" width="10.9" height="15.0" fill="rgb(254,24,7)" rx="2" ry="2" />
+<text  x="515.59" y="559.5" ></text>
+</g>
+<g >
+<title>SSL_read (7 samples, 3.24%)</title><rect x="447.0" y="741" width="38.3" height="15.0" fill="rgb(252,146,11)" rx="2" ry="2" />
+<text  x="450.04" y="751.5" >SSL..</text>
+</g>
+<g >
+<title>Envoy::Server::LdsApiImpl::onConfigUpdate (2 samples, 0.93%)</title><rect x="59.2" y="517" width="10.9" height="15.0" fill="rgb(234,4,26)" rx="2" ry="2" />
+<text  x="62.17" y="527.5" ></text>
+</g>
+<g >
+<title>Envoy::ThreadLocal::InstanceImpl::Bookkeeper::get (1 samples, 0.46%)</title><rect x="987.9" y="565" width="5.4" height="15.0" fill="rgb(235,211,48)" rx="2" ry="2" />
+<text  x="990.87" y="575.5" ></text>
+</g>
+<g >
+<title>event_active_nolock_ (1 samples, 0.46%)</title><rect x="173.9" y="805" width="5.5" height="15.0" fill="rgb(225,218,31)" rx="2" ry="2" />
+<text  x="176.89" y="815.5" ></text>
+</g>
+<g >
+<title>google::protobuf::DynamicMessage::SharedCtor (1 samples, 0.46%)</title><rect x="59.2" y="133" width="5.4" height="15.0" fill="rgb(209,202,43)" rx="2" ry="2" />
+<text  x="62.17" y="143.5" ></text>
+</g>
+<g >
+<title>Envoy::Config::GrpcMuxImpl::onDiscoveryResponse (2 samples, 0.93%)</title><rect x="59.2" y="565" width="10.9" height="15.0" fill="rgb(219,146,4)" rx="2" ry="2" />
+<text  x="62.17" y="575.5" ></text>
+</g>
+<g >
+<title>Envoy::Network::ConnectionImpl::onWriteReady (8 samples, 3.70%)</title><rect x="1108.1" y="789" width="43.7" height="15.0" fill="rgb(237,112,19)" rx="2" ry="2" />
+<text  x="1111.06" y="799.5" >Envo..</text>
+</g>
+<g >
+<title>Envoy::Extensions::AccessLoggers::File::FileAccessLog::emitLog (1 samples, 0.46%)</title><rect x="53.7" y="741" width="5.5" height="15.0" fill="rgb(218,76,47)" rx="2" ry="2" />
+<text  x="56.70" y="751.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::onRequestHeaders (13 samples, 6.02%)</title><rect x="884.1" y="597" width="71.0" height="15.0" fill="rgb(243,14,20)" rx="2" ry="2" />
+<text  x="887.07" y="607.5" >Envoy::E..</text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::$_8::__invoke (4 samples, 1.85%)</title><rect x="70.1" y="661" width="21.8" height="15.0" fill="rgb(234,36,14)" rx="2" ry="2" />
+<text  x="73.09" y="671.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Router::Filter::UpstreamRequest::decodeData (5 samples, 2.31%)</title><rect x="512.6" y="597" width="27.3" height="15.0" fill="rgb(217,168,4)" rx="2" ry="2" />
+<text  x="515.59" y="607.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Server::AdminImpl::handlerStats (2 samples, 0.93%)</title><rect x="75.6" y="533" width="10.9" height="15.0" fill="rgb(214,80,13)" rx="2" ry="2" />
+<text  x="78.56" y="543.5" ></text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::PrintAny (1 samples, 0.46%)</title><rect x="59.2" y="309" width="5.4" height="15.0" fill="rgb(236,143,37)" rx="2" ry="2" />
+<text  x="62.17" y="319.5" ></text>
+</g>
+<g >
+<title>__pthread_mutex_lock (1 samples, 0.46%)</title><rect x="48.2" y="805" width="5.5" height="15.0" fill="rgb(229,119,25)" rx="2" ry="2" />
+<text  x="51.24" y="815.5" ></text>
+</g>
+<g >
+<title>google::protobuf::DynamicMessageFactory::GetPrototypeNoLock (1 samples, 0.46%)</title><rect x="59.2" y="149" width="5.4" height="15.0" fill="rgb(216,214,50)" rx="2" ry="2" />
+<text  x="62.17" y="159.5" ></text>
+</g>
+<g >
+<title>google::protobuf::Map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;::Map (2 samples, 0.93%)</title><rect x="228.5" y="693" width="10.9" height="15.0" fill="rgb(242,28,22)" rx="2" ry="2" />
+<text  x="231.52" y="703.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Null::Plugin::getValue&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt; (3 samples, 1.39%)</title><rect x="310.5" y="677" width="16.4" height="15.0" fill="rgb(214,42,6)" rx="2" ry="2" />
+<text  x="313.46" y="687.5" ></text>
+</g>
+<g >
+<title>Envoy::Stats::CounterImpl::add (1 samples, 0.46%)</title><rect x="217.6" y="693" width="5.5" height="15.0" fill="rgb(253,174,31)" rx="2" ry="2" />
+<text  x="220.59" y="703.5" ></text>
+</g>
+<g >
+<title>bssl::tls_open_record (4 samples, 1.85%)</title><rect x="458.0" y="693" width="21.8" height="15.0" fill="rgb(234,166,43)" rx="2" ry="2" />
+<text  x="460.96" y="703.5" >b..</text>
+</g>
+<g >
+<title>google::protobuf::DynamicMessageFactory::GetPrototypeNoLock (1 samples, 0.46%)</title><rect x="59.2" y="181" width="5.4" height="15.0" fill="rgb(216,214,50)" rx="2" ry="2" />
+<text  x="62.17" y="191.5" ></text>
+</g>
+<g >
+<title>Envoy::Upstream::ClusterManagerImpl::httpConnPoolForCluster (2 samples, 0.93%)</title><rect x="862.2" y="581" width="10.9" height="15.0" fill="rgb(239,94,45)" rx="2" ry="2" />
+<text  x="865.22" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Network::ConnectionImpl::onFileEvent (6 samples, 2.78%)</title><rect x="59.2" y="773" width="32.7" height="15.0" fill="rgb(214,194,0)" rx="2" ry="2" />
+<text  x="62.17" y="783.5" >En..</text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::encodeData (2 samples, 0.93%)</title><rect x="512.6" y="581" width="10.9" height="15.0" fill="rgb(239,215,29)" rx="2" ry="2" />
+<text  x="515.59" y="591.5" ></text>
+</g>
+<g >
+<title>__libc_read (3 samples, 1.39%)</title><rect x="31.9" y="885" width="16.3" height="15.0" fill="rgb(225,66,31)" rx="2" ry="2" />
+<text  x="34.85" y="895.5" ></text>
+</g>
+<g >
+<title>std::__1::vector&lt;Envoy::Extensions::Tracers::Zipkin::BinaryAnnotation, std::__1::allocator&lt;Envoy::Extensions::Tracers::Zipkin::BinaryAnnotation&gt; &gt;::__emplace_back_slow_path&lt;Envoy::Extensions::Tracers::Zipkin::BinaryAnnotation&gt; (1 samples, 0.46%)</title><rect x="397.9" y="741" width="5.4" height="15.0" fill="rgb(208,103,22)" rx="2" ry="2" />
+<text  x="400.87" y="751.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::Filter::decodeHeaders (1 samples, 0.46%)</title><rect x="1162.7" y="741" width="5.4" height="15.0" fill="rgb(219,15,1)" rx="2" ry="2" />
+<text  x="1165.69" y="751.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::CodecClient::responseDecodeComplete (1 samples, 0.46%)</title><rect x="507.1" y="613" width="5.5" height="15.0" fill="rgb(234,28,35)" rx="2" ry="2" />
+<text  x="510.13" y="623.5" ></text>
+</g>
+<g >
+<title>virtual thunk to Envoy::Network::ConnectionImpl::state (2 samples, 0.93%)</title><rect x="1097.1" y="757" width="11.0" height="15.0" fill="rgb(228,5,5)" rx="2" ry="2" />
+<text  x="1100.13" y="767.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::Filter::UpstreamRequest::UpstreamRequest (1 samples, 0.46%)</title><rect x="856.8" y="597" width="5.4" height="15.0" fill="rgb(210,109,36)" rx="2" ry="2" />
+<text  x="859.76" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Server::InstanceImpl::run (9 samples, 4.17%)</title><rect x="48.2" y="837" width="49.2" height="15.0" fill="rgb(243,181,13)" rx="2" ry="2" />
+<text  x="51.24" y="847.5" >Envo..</text>
+</g>
+<g >
+<title>Envoy::StreamInfo::FilterStateImpl::maybeCreateParent (1 samples, 0.46%)</title><rect x="856.8" y="549" width="5.4" height="15.0" fill="rgb(246,133,23)" rx="2" ry="2" />
+<text  x="859.76" y="559.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Exports::get_property (3 samples, 1.39%)</title><rect x="255.8" y="677" width="16.4" height="15.0" fill="rgb(227,14,17)" rx="2" ry="2" />
+<text  x="258.83" y="687.5" ></text>
+</g>
+<g >
+<title>event_queue_remove_timeout (1 samples, 0.46%)</title><rect x="1179.1" y="837" width="5.4" height="15.0" fill="rgb(241,177,36)" rx="2" ry="2" />
+<text  x="1182.07" y="847.5" ></text>
+</g>
+<g >
+<title>Envoy::Server::AdminImpl::runCallback (4 samples, 1.85%)</title><rect x="70.1" y="549" width="21.8" height="15.0" fill="rgb(207,114,31)" rx="2" ry="2" />
+<text  x="73.09" y="559.5" >E..</text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::PrintAny (1 samples, 0.46%)</title><rect x="59.2" y="213" width="5.4" height="15.0" fill="rgb(236,143,37)" rx="2" ry="2" />
+<text  x="62.17" y="223.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Tracers::Zipkin::JsonV2Serializer::serialize (1 samples, 0.46%)</title><rect x="1157.2" y="789" width="5.5" height="15.0" fill="rgb(217,20,4)" rx="2" ry="2" />
+<text  x="1160.22" y="799.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::$_5::__invoke (1 samples, 0.46%)</title><rect x="725.6" y="693" width="5.5" height="15.0" fill="rgb(222,2,1)" rx="2" ry="2" />
+<text  x="728.65" y="703.5" ></text>
+</g>
+<g >
+<title>SSL_in_init (1 samples, 0.46%)</title><rect x="288.6" y="597" width="5.5" height="15.0" fill="rgb(213,11,23)" rx="2" ry="2" />
+<text  x="291.61" y="607.5" ></text>
+</g>
+<g >
+<title>envoy::api::v2::Listener::SharedDtor (1 samples, 0.46%)</title><rect x="64.6" y="485" width="5.5" height="15.0" fill="rgb(220,128,5)" rx="2" ry="2" />
+<text  x="67.63" y="495.5" ></text>
+</g>
+<g >
+<title>absl::container_internal::raw_hash_set&lt;absl::container_internal::FlatHashMapPolicy&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::unique_ptr&lt;Envoy::Upstream::ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry, std::__1::default_delete&lt;Envoy::Upstream::ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry&gt; &gt; &gt;, absl::container_internal::StringHash, absl::container_internal::StringHashEq::Eq, std::__1::allocator&lt;std::__1::pair&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; const, std::__1::unique_ptr&lt;Envoy::Upstream::ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry, std::__1::default_delete&lt;Envoy::Upstream::ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry&gt; &gt; &gt; &gt; &gt;::find&lt;absl::string_view&gt; (1 samples, 0.46%)</title><rect x="982.4" y="597" width="5.5" height="15.0" fill="rgb(210,61,1)" rx="2" ry="2" />
+<text  x="985.41" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Network::FilterManagerImpl::onContinueReading (113 samples, 52.31%)</title><rect x="490.7" y="773" width="617.4" height="15.0" fill="rgb(220,154,29)" rx="2" ry="2" />
+<text  x="493.74" y="783.5" >Envoy::Network::FilterManagerImpl::onContinueReading</text>
+</g>
+<g >
+<title>X509V3_get_d2i (2 samples, 0.93%)</title><rect x="1009.7" y="565" width="10.9" height="15.0" fill="rgb(209,216,30)" rx="2" ry="2" />
+<text  x="1012.72" y="575.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::Filter::UpstreamRequest::~UpstreamRequest (2 samples, 0.93%)</title><rect x="529.0" y="549" width="10.9" height="15.0" fill="rgb(222,119,44)" rx="2" ry="2" />
+<text  x="531.98" y="559.5" ></text>
+</g>
+<g >
+<title>google::protobuf::Value::~Value (2 samples, 0.93%)</title><rect x="381.5" y="693" width="10.9" height="15.0" fill="rgb(241,210,8)" rx="2" ry="2" />
+<text  x="384.48" y="703.5" ></text>
+</g>
+<g >
+<title>operator new[] (1 samples, 0.46%)</title><rect x="310.5" y="565" width="5.4" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="313.46" y="575.5" ></text>
+</g>
+<g >
+<title>aes_hw_encrypt (1 samples, 0.46%)</title><rect x="474.4" y="629" width="5.4" height="15.0" fill="rgb(248,66,43)" rx="2" ry="2" />
+<text  x="477.35" y="639.5" ></text>
+</g>
+<g >
+<title>absl::container_internal::raw_hash_map&lt;absl::container_internal::FlatHashMapPolicy&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::unique_ptr&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject, std::__1::default_delete&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject&gt; &gt; &gt;, absl::container_internal::StringHash, absl::container_internal::StringHashEq::Eq, std::__1::allocator&lt;std::__1::pair&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; const, std::__1::unique_ptr&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject, std::__1::default_delete&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject&gt; &gt; &gt; &gt; &gt;::try_emplace_impl&lt;absl::string_view const&amp;&gt; (2 samples, 0.93%)</title><rect x="933.2" y="501" width="11.0" height="15.0" fill="rgb(208,95,9)" rx="2" ry="2" />
+<text  x="936.24" y="511.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::ConfigImpl::internalOnlyHeaders (1 samples, 0.46%)</title><rect x="1042.5" y="629" width="5.5" height="15.0" fill="rgb(207,124,3)" rx="2" ry="2" />
+<text  x="1045.50" y="639.5" ></text>
+</g>
+<g >
+<title>Envoy::Network::SocketImpl::ioHandle (1 samples, 0.46%)</title><rect x="1086.2" y="757" width="5.5" height="15.0" fill="rgb(241,39,50)" rx="2" ry="2" />
+<text  x="1089.20" y="767.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Tracers::Zipkin::BinaryAnnotation::BinaryAnnotation (1 samples, 0.46%)</title><rect x="397.9" y="725" width="5.4" height="15.0" fill="rgb(238,171,44)" rx="2" ry="2" />
+<text  x="400.87" y="735.5" ></text>
+</g>
+<g >
+<title>operator new[] (2 samples, 0.93%)</title><rect x="933.2" y="437" width="11.0" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="936.24" y="447.5" ></text>
+</g>
+<g >
+<title>Envoy::Upstream::ClusterManagerImpl::get (3 samples, 1.39%)</title><rect x="971.5" y="613" width="16.4" height="15.0" fill="rgb(243,197,19)" rx="2" ry="2" />
+<text  x="974.48" y="623.5" ></text>
+</g>
+<g >
+<title>google::protobuf::Map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, google::protobuf::Struct&gt;::~Map (2 samples, 0.93%)</title><rect x="381.5" y="741" width="10.9" height="15.0" fill="rgb(217,131,20)" rx="2" ry="2" />
+<text  x="384.48" y="751.5" ></text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::PrintField (1 samples, 0.46%)</title><rect x="59.2" y="245" width="5.4" height="15.0" fill="rgb(234,92,18)" rx="2" ry="2" />
+<text  x="62.17" y="255.5" ></text>
+</g>
+<g >
+<title>std::__1::__function::__func&lt;Envoy::Extensions::HttpFilters::Fault::FaultFilterFactory::createFilterFactoryFromProtoTyped (1 samples, 0.46%)</title><rect x="742.0" y="597" width="5.5" height="15.0" fill="rgb(239,117,7)" rx="2" ry="2" />
+<text  x="745.04" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::CodeStatsImpl::chargeBasicResponseStat (2 samples, 0.93%)</title><rect x="616.4" y="581" width="10.9" height="15.0" fill="rgb(208,150,52)" rx="2" ry="2" />
+<text  x="619.39" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStreamDecoderFilter::~ActiveStreamDecoderFilter (2 samples, 0.93%)</title><rect x="370.6" y="773" width="10.9" height="15.0" fill="rgb(229,42,35)" rx="2" ry="2" />
+<text  x="373.56" y="783.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::HeaderMapImpl::setReferenceKey (1 samples, 0.46%)</title><rect x="840.4" y="597" width="5.4" height="15.0" fill="rgb(247,60,11)" rx="2" ry="2" />
+<text  x="843.37" y="607.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.93%)</title><rect x="10.0" y="853" width="10.9" height="15.0" fill="rgb(212,179,10)" rx="2" ry="2" />
+<text  x="13.00" y="863.5" ></text>
+</g>
+<g >
+<title>__libc_write (1 samples, 0.46%)</title><rect x="97.4" y="885" width="5.5" height="15.0" fill="rgb(214,44,9)" rx="2" ry="2" />
+<text  x="100.41" y="895.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::HeaderMapImpl::get (1 samples, 0.46%)</title><rect x="589.1" y="501" width="5.4" height="15.0" fill="rgb(218,168,21)" rx="2" ry="2" />
+<text  x="592.07" y="511.5" ></text>
+</g>
+<g >
+<title>Envoy::Upstream::ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry::connPool (2 samples, 0.93%)</title><rect x="862.2" y="565" width="10.9" height="15.0" fill="rgb(216,105,39)" rx="2" ry="2" />
+<text  x="865.22" y="575.5" ></text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::PrintField (1 samples, 0.46%)</title><rect x="59.2" y="277" width="5.4" height="15.0" fill="rgb(234,92,18)" rx="2" ry="2" />
+<text  x="62.17" y="287.5" ></text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="20.9" y="885" width="5.5" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="23.93" y="895.5" ></text>
+</g>
+<g >
+<title>__cxxabiv1::__vmi_class_type_info::search_above_dst (1 samples, 0.46%)</title><rect x="26.4" y="853" width="5.5" height="15.0" fill="rgb(222,140,26)" rx="2" ry="2" />
+<text  x="29.39" y="863.5" ></text>
+</g>
+<g >
+<title>Envoy::Grpc::AsyncStreamCallbacks&lt;envoy::api::v2::DiscoveryResponse&gt;::onReceiveMessageRaw (2 samples, 0.93%)</title><rect x="59.2" y="581" width="10.9" height="15.0" fill="rgb(238,92,6)" rx="2" ry="2" />
+<text  x="62.17" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Buffer::WatermarkBuffer::reserve (1 samples, 0.46%)</title><rect x="567.2" y="597" width="5.5" height="15.0" fill="rgb(252,190,41)" rx="2" ry="2" />
+<text  x="570.22" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::addStreamFilter (1 samples, 0.46%)</title><rect x="747.5" y="581" width="5.5" height="15.0" fill="rgb(247,72,18)" rx="2" ry="2" />
+<text  x="750.50" y="591.5" ></text>
+</g>
+<g >
+<title>__dynamic_cast (2 samples, 0.93%)</title><rect x="261.3" y="629" width="10.9" height="15.0" fill="rgb(248,185,35)" rx="2" ry="2" />
+<text  x="264.30" y="639.5" ></text>
+</g>
+<g >
+<title>all (216 samples, 100%)</title><rect x="10.0" y="933" width="1180.0" height="15.0" fill="rgb(227,0,44)" rx="2" ry="2" />
+<text  x="13.00" y="943.5" ></text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::Print (1 samples, 0.46%)</title><rect x="59.2" y="437" width="5.4" height="15.0" fill="rgb(238,206,35)" rx="2" ry="2" />
+<text  x="62.17" y="447.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::onResponseHeaders (4 samples, 1.85%)</title><rect x="578.1" y="581" width="21.9" height="15.0" fill="rgb(221,135,3)" rx="2" ry="2" />
+<text  x="581.15" y="591.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Server::AdminFilter::onComplete (4 samples, 1.85%)</title><rect x="70.1" y="565" width="21.8" height="15.0" fill="rgb(244,128,35)" rx="2" ry="2" />
+<text  x="73.09" y="575.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Extensions::TransportSockets::Tls::(anonymous namespace)::getRFC2253NameFromCertificate (1 samples, 0.46%)</title><rect x="1020.6" y="565" width="5.5" height="15.0" fill="rgb(251,132,16)" rx="2" ry="2" />
+<text  x="1023.65" y="575.5" ></text>
+</g>
+<g >
+<title>Wasm::Common::(anonymous namespace)::populateRequestInfo (8 samples, 3.70%)</title><rect x="288.6" y="693" width="43.7" height="15.0" fill="rgb(242,106,38)" rx="2" ry="2" />
+<text  x="291.61" y="703.5" >Wasm..</text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::onData (83 samples, 38.43%)</title><rect x="632.8" y="757" width="453.4" height="15.0" fill="rgb(208,187,52)" rx="2" ry="2" />
+<text  x="635.78" y="767.5" >Envoy::Http::ConnectionManagerImpl::onData</text>
+</g>
+<g >
+<title>std::__1::basic_regex&lt;char, std::__1::regex_traits&lt;char&gt; &gt;::__search&lt;std::__1::allocator&lt;std::__1::sub_match&lt;char const*&gt; &gt; &gt; (1 samples, 0.46%)</title><rect x="70.1" y="437" width="5.5" height="15.0" fill="rgb(238,198,3)" rx="2" ry="2" />
+<text  x="73.09" y="447.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ResponseStreamEncoderImpl::encodeHeaders (1 samples, 0.46%)</title><rect x="572.7" y="597" width="5.4" height="15.0" fill="rgb(248,14,33)" rx="2" ry="2" />
+<text  x="575.69" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::onMessageBeginBase (4 samples, 1.85%)</title><rect x="665.6" y="677" width="21.8" height="15.0" fill="rgb(212,136,37)" rx="2" ry="2" />
+<text  x="668.56" y="687.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Extensions::Wasm::MetadataExchange::Plugin::PluginContext::onRequestHeaders (8 samples, 3.70%)</title><rect x="911.4" y="565" width="43.7" height="15.0" fill="rgb(232,187,29)" rx="2" ry="2" />
+<text  x="914.39" y="575.5" >Envo..</text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ServerConnectionImpl::onMessageComplete (4 samples, 1.85%)</title><rect x="70.1" y="629" width="21.8" height="15.0" fill="rgb(230,216,50)" rx="2" ry="2" />
+<text  x="73.09" y="639.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Http::Http2::ConnectionImpl::dispatch (2 samples, 0.93%)</title><rect x="59.2" y="693" width="10.9" height="15.0" fill="rgb(236,49,41)" rx="2" ry="2" />
+<text  x="62.17" y="703.5" ></text>
+</g>
+<g >
+<title>google::protobuf::Struct::~Struct (1 samples, 0.46%)</title><rect x="829.4" y="597" width="5.5" height="15.0" fill="rgb(224,41,34)" rx="2" ry="2" />
+<text  x="832.44" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::completeLastHeader (7 samples, 3.24%)</title><rect x="687.4" y="677" width="38.2" height="15.0" fill="rgb(208,148,14)" rx="2" ry="2" />
+<text  x="690.41" y="687.5" >Env..</text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::Print (1 samples, 0.46%)</title><rect x="59.2" y="261" width="5.4" height="15.0" fill="rgb(238,206,35)" rx="2" ry="2" />
+<text  x="62.17" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.93%)</title><rect x="10.0" y="869" width="10.9" height="15.0" fill="rgb(212,179,10)" rx="2" ry="2" />
+<text  x="13.00" y="879.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::TransportSockets::Tls::SslSocket::sslReadIntoSlice (8 samples, 3.70%)</title><rect x="441.6" y="757" width="43.7" height="15.0" fill="rgb(250,192,13)" rx="2" ry="2" />
+<text  x="444.57" y="767.5" >Envo..</text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::getProperty (2 samples, 0.93%)</title><rect x="261.3" y="661" width="10.9" height="15.0" fill="rgb(215,195,21)" rx="2" ry="2" />
+<text  x="264.30" y="671.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::TransportSockets::Tls::Utility::getSubjectFromCertificate (1 samples, 0.46%)</title><rect x="1020.6" y="581" width="5.5" height="15.0" fill="rgb(226,142,14)" rx="2" ry="2" />
+<text  x="1023.65" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::TransportSockets::Tls::SslSocket::doRead (10 samples, 4.63%)</title><rect x="436.1" y="773" width="54.6" height="15.0" fill="rgb(234,62,35)" rx="2" ry="2" />
+<text  x="439.11" y="783.5" >Envoy..</text>
+</g>
+<g >
+<title>Wasm::Common::populateHTTPRequestInfo (9 samples, 4.17%)</title><rect x="283.1" y="709" width="49.2" height="15.0" fill="rgb(251,50,7)" rx="2" ry="2" />
+<text  x="286.15" y="719.5" >Wasm..</text>
+</g>
+<g >
+<title>Envoy::ThreadLocal::Slot::getTyped&lt;Envoy::Extensions::Tracers::Zipkin::Driver::TlsTracer&gt; (1 samples, 0.46%)</title><rect x="987.9" y="581" width="5.4" height="15.0" fill="rgb(218,15,13)" rx="2" ry="2" />
+<text  x="990.87" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ClientConnectionImpl::onMessageComplete (6 samples, 2.78%)</title><rect x="507.1" y="645" width="32.8" height="15.0" fill="rgb(228,158,46)" rx="2" ry="2" />
+<text  x="510.13" y="655.5" >En..</text>
+</g>
+<g >
+<title>Envoy::Router::Filter::chargeUpstreamCode (3 samples, 1.39%)</title><rect x="610.9" y="613" width="16.4" height="15.0" fill="rgb(238,119,51)" rx="2" ry="2" />
+<text  x="613.93" y="623.5" ></text>
+</g>
+<g >
+<title>Envoy::Upstream::ConnPoolMap&lt;std::__1::vector&lt;unsigned char, std::__1::allocator&lt;unsigned char&gt; &gt;, Envoy::Http::ConnectionPool::Instance&gt;::getPool (1 samples, 0.46%)</title><rect x="1162.7" y="677" width="5.4" height="15.0" fill="rgb(239,225,32)" rx="2" ry="2" />
+<text  x="1165.69" y="687.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::HeaderMapImpl::~HeaderMapImpl (2 samples, 0.93%)</title><rect x="10.0" y="885" width="10.9" height="15.0" fill="rgb(233,158,45)" rx="2" ry="2" />
+<text  x="13.00" y="895.5" ></text>
+</g>
+<g >
+<title>absl::container_internal::raw_hash_set&lt;absl::container_internal::FlatHashMapPolicy&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::unique_ptr&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject, std::__1::default_delete&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject&gt; &gt; &gt;, absl::container_internal::StringHash, absl::container_internal::StringHashEq::Eq, std::__1::allocator&lt;std::__1::pair&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; const, std::__1::unique_ptr&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject, std::__1::default_delete&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject&gt; &gt; &gt; &gt; &gt;::resize (2 samples, 0.93%)</title><rect x="933.2" y="453" width="11.0" height="15.0" fill="rgb(218,80,3)" rx="2" ry="2" />
+<text  x="936.24" y="463.5" ></text>
+</g>
+<g >
+<title>Envoy::StreamInfo::StreamInfoImpl::StreamInfoImpl (1 samples, 0.46%)</title><rect x="856.8" y="581" width="5.4" height="15.0" fill="rgb(205,227,7)" rx="2" ry="2" />
+<text  x="859.76" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::VirtualHostImpl::getRouteFromEntries (1 samples, 0.46%)</title><rect x="960.6" y="581" width="5.4" height="15.0" fill="rgb(244,14,29)" rx="2" ry="2" />
+<text  x="963.56" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Thread::ThreadImplPosix::ThreadImplPosix (195 samples, 90.28%)</title><rect x="124.7" y="885" width="1065.3" height="15.0" fill="rgb(252,142,21)" rx="2" ry="2" />
+<text  x="127.72" y="895.5" >Envoy::Thread::ThreadImplPosix::ThreadImplPosix</text>
+</g>
+<g >
+<title>Envoy::Tracing::HttpTracerUtility::setCommonTags (1 samples, 0.46%)</title><rect x="414.3" y="757" width="5.4" height="15.0" fill="rgb(223,173,47)" rx="2" ry="2" />
+<text  x="417.26" y="767.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::dispatch (4 samples, 1.85%)</title><rect x="70.1" y="709" width="21.8" height="15.0" fill="rgb(244,216,42)" rx="2" ry="2" />
+<text  x="73.09" y="719.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Server::InstanceImpl::stats (1 samples, 0.46%)</title><rect x="86.5" y="533" width="5.4" height="15.0" fill="rgb(238,154,24)" rx="2" ry="2" />
+<text  x="89.48" y="543.5" ></text>
+</g>
+<g >
+<title>std::__1::__function::__func&lt;Envoy::Extensions::Tracers::Zipkin::ReporterImpl::ReporterImpl (2 samples, 0.93%)</title><rect x="1157.2" y="821" width="10.9" height="15.0" fill="rgb(233,1,17)" rx="2" ry="2" />
+<text  x="1160.22" y="831.5" ></text>
+</g>
+<g >
+<title>operator new[] (1 samples, 0.46%)</title><rect x="731.1" y="597" width="5.5" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="734.11" y="607.5" ></text>
+</g>
+<g >
+<title>__libc_start_main (9 samples, 4.17%)</title><rect x="48.2" y="885" width="49.2" height="15.0" fill="rgb(237,87,2)" rx="2" ry="2" />
+<text  x="51.24" y="895.5" >__li..</text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::traceRequest (2 samples, 0.93%)</title><rect x="987.9" y="629" width="10.9" height="15.0" fill="rgb(231,94,15)" rx="2" ry="2" />
+<text  x="990.87" y="639.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 samples, 0.46%)</title><rect x="26.4" y="869" width="5.5" height="15.0" fill="rgb(212,179,10)" rx="2" ry="2" />
+<text  x="29.39" y="879.5" ></text>
+</g>
+<g >
+<title>Envoy::Server::AdminImpl::shouldShowMetric&lt;Envoy::Stats::Counter&gt; (2 samples, 0.93%)</title><rect x="75.6" y="517" width="10.9" height="15.0" fill="rgb(209,22,46)" rx="2" ry="2" />
+<text  x="78.56" y="527.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::removeHeaderMapValue (1 samples, 0.46%)</title><rect x="927.8" y="533" width="5.4" height="15.0" fill="rgb(227,9,39)" rx="2" ry="2" />
+<text  x="930.78" y="543.5" ></text>
+</g>
+<g >
+<title>Envoy::Event::FileEventImpl::assignEvents (134 samples, 62.04%)</title><rect x="425.2" y="821" width="732.0" height="15.0" fill="rgb(236,95,31)" rx="2" ry="2" />
+<text  x="428.19" y="831.5" >Envoy::Event::FileEventImpl::assignEvents</text>
+</g>
+<g >
+<title>Wasm::Common::getTrafficDirection (1 samples, 0.46%)</title><rect x="889.5" y="517" width="5.5" height="15.0" fill="rgb(244,210,25)" rx="2" ry="2" />
+<text  x="892.54" y="527.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::decodeHeaders (36 samples, 16.67%)</title><rect x="763.9" y="629" width="196.7" height="15.0" fill="rgb(224,144,33)" rx="2" ry="2" />
+<text  x="766.89" y="639.5" >Envoy::Http::ConnectionMa..</text>
+</g>
+<g >
+<title>envoy::api::v2::core::Metadata::~Metadata (3 samples, 1.39%)</title><rect x="381.5" y="757" width="16.4" height="15.0" fill="rgb(222,125,46)" rx="2" ry="2" />
+<text  x="384.48" y="767.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Null::Plugin::Stats::IstioDimensions::to_string (3 samples, 1.39%)</title><rect x="239.4" y="709" width="16.4" height="15.0" fill="rgb(219,39,1)" rx="2" ry="2" />
+<text  x="242.44" y="719.5" ></text>
+</g>
+<g >
+<title>virtual thunk to Envoy::Extensions::HttpFilters::HealthCheck::HealthCheckFilter::encodeHeaders (1 samples, 0.46%)</title><rect x="605.5" y="597" width="5.4" height="15.0" fill="rgb(228,189,26)" rx="2" ry="2" />
+<text  x="608.46" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Network::ConnectionImpl::onReadReady (123 samples, 56.94%)</title><rect x="436.1" y="789" width="672.0" height="15.0" fill="rgb(250,132,23)" rx="2" ry="2" />
+<text  x="439.11" y="799.5" >Envoy::Network::ConnectionImpl::onReadReady</text>
+</g>
+<g >
+<title>envoy (216 samples, 100.00%)</title><rect x="10.0" y="917" width="1180.0" height="15.0" fill="rgb(251,66,47)" rx="2" ry="2" />
+<text  x="13.00" y="927.5" >envoy</text>
+</g>
+<g >
+<title>operator new[] (1 samples, 0.46%)</title><rect x="59.2" y="37" width="5.4" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="62.17" y="47.5" ></text>
+</g>
+<g >
+<title>Envoy::Base64::decodeWithoutPadding (2 samples, 0.93%)</title><rect x="911.4" y="549" width="10.9" height="15.0" fill="rgb(239,44,7)" rx="2" ry="2" />
+<text  x="914.39" y="559.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::FindValue (1 samples, 0.46%)</title><rect x="310.5" y="629" width="5.4" height="15.0" fill="rgb(213,208,13)" rx="2" ry="2" />
+<text  x="313.46" y="639.5" ></text>
+</g>
+<g >
+<title>epoll_nochangelist_del (1 samples, 0.46%)</title><rect x="1069.8" y="677" width="5.5" height="15.0" fill="rgb(241,115,6)" rx="2" ry="2" />
+<text  x="1072.81" y="687.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::TransportSockets::Tls::SslSocket::doWrite (5 samples, 2.31%)</title><rect x="1124.4" y="773" width="27.4" height="15.0" fill="rgb(210,49,47)" rx="2" ry="2" />
+<text  x="1127.44" y="783.5" >E..</text>
+</g>
+<g >
+<title>google::protobuf::Map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, google::protobuf::Value&gt;::operator[] (1 samples, 0.46%)</title><rect x="818.5" y="581" width="5.5" height="15.0" fill="rgb(253,182,54)" rx="2" ry="2" />
+<text  x="821.52" y="591.5" ></text>
+</g>
+<g >
+<title>event_del (2 samples, 0.93%)</title><rect x="1069.8" y="709" width="10.9" height="15.0" fill="rgb(233,205,0)" rx="2" ry="2" />
+<text  x="1072.81" y="719.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::AsyncStreamImpl::encodeData (2 samples, 0.93%)</title><rect x="59.2" y="613" width="10.9" height="15.0" fill="rgb(209,102,8)" rx="2" ry="2" />
+<text  x="62.17" y="623.5" ></text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::PrintToString (1 samples, 0.46%)</title><rect x="59.2" y="453" width="5.4" height="15.0" fill="rgb(213,61,0)" rx="2" ry="2" />
+<text  x="62.17" y="463.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::$_8::__invoke (1 samples, 0.46%)</title><rect x="731.1" y="693" width="5.5" height="15.0" fill="rgb(234,36,14)" rx="2" ry="2" />
+<text  x="734.11" y="703.5" ></text>
+</g>
+<g >
+<title>operator new[] (1 samples, 0.46%)</title><rect x="1157.2" y="725" width="5.5" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="1160.22" y="735.5" ></text>
+</g>
+<g >
+<title>envoy::api::v2::Listener::~Listener (1 samples, 0.46%)</title><rect x="64.6" y="501" width="5.5" height="15.0" fill="rgb(235,201,12)" rx="2" ry="2" />
+<text  x="67.63" y="511.5" ></text>
+</g>
+<g >
+<title>Envoy::MessageUtil::hash (1 samples, 0.46%)</title><rect x="59.2" y="469" width="5.4" height="15.0" fill="rgb(215,182,4)" rx="2" ry="2" />
+<text  x="62.17" y="479.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::onMessageCompleteBase (6 samples, 2.78%)</title><rect x="507.1" y="661" width="32.8" height="15.0" fill="rgb(247,58,2)" rx="2" ry="2" />
+<text  x="510.13" y="671.5" >En..</text>
+</g>
+<g >
+<title>Envoy::Http::Istio::AuthN::AuthenticationFilter::decodeHeaders (8 samples, 3.70%)</title><rect x="796.7" y="613" width="43.7" height="15.0" fill="rgb(248,78,5)" rx="2" ry="2" />
+<text  x="799.67" y="623.5" >Envo..</text>
+</g>
+<g >
+<title>sock_read (1 samples, 0.46%)</title><rect x="479.8" y="661" width="5.5" height="15.0" fill="rgb(229,195,26)" rx="2" ry="2" />
+<text  x="482.81" y="671.5" ></text>
+</g>
+<g >
+<title>do_name_ex (1 samples, 0.46%)</title><rect x="1020.6" y="549" width="5.5" height="15.0" fill="rgb(236,226,54)" rx="2" ry="2" />
+<text  x="1023.65" y="559.5" ></text>
+</g>
+<g >
+<title>Envoy::StreamInfo::StreamInfoImpl::hasResponseFlag (1 samples, 0.46%)</title><rect x="414.3" y="741" width="5.4" height="15.0" fill="rgb(250,62,16)" rx="2" ry="2" />
+<text  x="417.26" y="751.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::onDelete (2 samples, 0.93%)</title><rect x="359.6" y="773" width="11.0" height="15.0" fill="rgb(220,38,6)" rx="2" ry="2" />
+<text  x="362.63" y="783.5" ></text>
+</g>
+<g >
+<title>Envoy::Upstream::ClusterManagerImpl::httpConnPoolForCluster (1 samples, 0.46%)</title><rect x="1162.7" y="709" width="5.4" height="15.0" fill="rgb(239,94,45)" rx="2" ry="2" />
+<text  x="1165.69" y="719.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::onData (4 samples, 1.85%)</title><rect x="70.1" y="725" width="21.8" height="15.0" fill="rgb(208,187,52)" rx="2" ry="2" />
+<text  x="73.09" y="735.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Extensions::NetworkFilters::HttpConnectionManager::HttpConnectionManagerConfig::createFilterChain (5 samples, 2.31%)</title><rect x="736.6" y="613" width="27.3" height="15.0" fill="rgb(250,225,16)" rx="2" ry="2" />
+<text  x="739.57" y="623.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Http::CodecClient::CodecReadFilter::onData (2 samples, 0.93%)</title><rect x="59.2" y="725" width="10.9" height="15.0" fill="rgb(221,89,15)" rx="2" ry="2" />
+<text  x="62.17" y="735.5" ></text>
+</g>
+<g >
+<title>epoll_wait (2 samples, 0.93%)</title><rect x="108.3" y="885" width="11.0" height="15.0" fill="rgb(246,217,31)" rx="2" ry="2" />
+<text  x="111.33" y="895.5" ></text>
+</g>
+<g >
+<title>Envoy::Server::WorkerImpl::threadRoutine (195 samples, 90.28%)</title><rect x="124.7" y="869" width="1065.3" height="15.0" fill="rgb(233,168,26)" rx="2" ry="2" />
+<text  x="127.72" y="879.5" >Envoy::Server::WorkerImpl::threadRoutine</text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::dispatch (78 samples, 36.11%)</title><rect x="638.2" y="741" width="426.2" height="15.0" fill="rgb(244,216,42)" rx="2" ry="2" />
+<text  x="641.24" y="751.5" >Envoy::Http::Http1::ConnectionImpl::dispatch</text>
+</g>
+<g >
+<title>Envoy::Extensions::Wasm::MetadataExchange::Plugin::PluginContext::onResponseHeaders (2 samples, 0.93%)</title><rect x="589.1" y="549" width="10.9" height="15.0" fill="rgb(206,45,28)" rx="2" ry="2" />
+<text  x="592.07" y="559.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::decodeHeaders (4 samples, 1.85%)</title><rect x="70.1" y="613" width="21.8" height="15.0" fill="rgb(224,144,33)" rx="2" ry="2" />
+<text  x="73.09" y="623.5" >E..</text>
+</g>
+<g >
+<title>nghttp2_session_on_data_received (2 samples, 0.93%)</title><rect x="59.2" y="661" width="10.9" height="15.0" fill="rgb(247,91,44)" rx="2" ry="2" />
+<text  x="62.17" y="671.5" ></text>
+</g>
+<g >
+<title>Envoy::Event::FileEventImpl::assignEvents (6 samples, 2.78%)</title><rect x="59.2" y="789" width="32.7" height="15.0" fill="rgb(236,95,31)" rx="2" ry="2" />
+<text  x="62.17" y="799.5" >En..</text>
+</g>
+<g >
+<title>Envoy::Extensions::TransportSockets::Tls::SslSocketInfo::dnsSansPeerCertificate (3 samples, 1.39%)</title><rect x="1004.3" y="597" width="16.3" height="15.0" fill="rgb(228,23,28)" rx="2" ry="2" />
+<text  x="1007.26" y="607.5" ></text>
+</g>
+<g >
+<title>google::protobuf::Map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;::Map (1 samples, 0.46%)</title><rect x="337.8" y="709" width="5.4" height="15.0" fill="rgb(242,28,22)" rx="2" ry="2" />
+<text  x="340.78" y="719.5" ></text>
+</g>
+<g >
+<title>google::protobuf::Map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;::InnerMap::FindHelper (1 samples, 0.46%)</title><rect x="228.5" y="677" width="5.5" height="15.0" fill="rgb(206,153,0)" rx="2" ry="2" />
+<text  x="231.52" y="687.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::ConfigImpl::route (2 samples, 0.93%)</title><rect x="960.6" y="613" width="10.9" height="15.0" fill="rgb(215,147,8)" rx="2" ry="2" />
+<text  x="963.56" y="623.5" ></text>
+</g>
+<g >
+<title>std::__1::regex_replace&lt;std::__1::back_insert_iterator&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;, std::__1::__wrap_iter&lt;char const*&gt;, std::__1::regex_traits&lt;char&gt;, char&gt; (1 samples, 0.46%)</title><rect x="70.1" y="469" width="5.5" height="15.0" fill="rgb(228,170,45)" rx="2" ry="2" />
+<text  x="73.09" y="479.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::HeaderMapImpl::get (1 samples, 0.46%)</title><rect x="283.1" y="661" width="5.5" height="15.0" fill="rgb(218,168,21)" rx="2" ry="2" />
+<text  x="286.15" y="671.5" ></text>
+</g>
+<g >
+<title>evutil_gettime_monotonic_ (1 samples, 0.46%)</title><rect x="1184.5" y="853" width="5.5" height="15.0" fill="rgb(242,19,30)" rx="2" ry="2" />
+<text  x="1187.54" y="863.5" ></text>
+</g>
+<g >
+<title>Envoy::StreamInfo::FilterStateImpl::maybeCreateParent (1 samples, 0.46%)</title><rect x="856.8" y="485" width="5.4" height="15.0" fill="rgb(246,133,23)" rx="2" ry="2" />
+<text  x="859.76" y="495.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::CodecClient::onData (2 samples, 0.93%)</title><rect x="59.2" y="709" width="10.9" height="15.0" fill="rgb(225,42,23)" rx="2" ry="2" />
+<text  x="62.17" y="719.5" ></text>
+</g>
+<g >
+<title>Envoy::Server::LdsApiImpl::onConfigUpdate (2 samples, 0.93%)</title><rect x="59.2" y="533" width="10.9" height="15.0" fill="rgb(234,4,26)" rx="2" ry="2" />
+<text  x="62.17" y="543.5" ></text>
+</g>
+<g >
+<title>google::protobuf::util::(anonymous namespace)::DescriptorPoolTypeResolver::ResolveMessageType (1 samples, 0.46%)</title><rect x="1157.2" y="741" width="5.5" height="15.0" fill="rgb(213,38,26)" rx="2" ry="2" />
+<text  x="1160.22" y="751.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Utility::getProtocolString (1 samples, 0.46%)</title><rect x="403.3" y="757" width="5.5" height="15.0" fill="rgb(252,199,17)" rx="2" ry="2" />
+<text  x="406.33" y="767.5" ></text>
+</g>
+<g >
+<title>operator new[] (2 samples, 0.93%)</title><rect x="796.7" y="533" width="10.9" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="799.67" y="543.5" ></text>
+</g>
+<g >
+<title>operator delete[] (1 samples, 0.46%)</title><rect x="386.9" y="677" width="5.5" height="15.0" fill="rgb(247,31,0)" rx="2" ry="2" />
+<text  x="389.94" y="687.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::onMessageCompleteBase (4 samples, 1.85%)</title><rect x="70.1" y="645" width="21.8" height="15.0" fill="rgb(247,58,2)" rx="2" ry="2" />
+<text  x="73.09" y="655.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerUtility::mutateRequestHeaders (8 samples, 3.70%)</title><rect x="998.8" y="629" width="43.7" height="15.0" fill="rgb(207,80,48)" rx="2" ry="2" />
+<text  x="1001.80" y="639.5" >Envo..</text>
+</g>
+<g >
+<title>Envoy::Server::AdminFilter::decodeHeaders (4 samples, 1.85%)</title><rect x="70.1" y="581" width="21.8" height="15.0" fill="rgb(239,103,8)" rx="2" ry="2" />
+<text  x="73.09" y="591.5" >E..</text>
+</g>
+<g >
+<title>operator delete[] (1 samples, 0.46%)</title><rect x="829.4" y="565" width="5.5" height="15.0" fill="rgb(247,31,0)" rx="2" ry="2" />
+<text  x="832.44" y="575.5" ></text>
+</g>
+<g >
+<title>Envoy::Buffer::WatermarkBuffer::drain (1 samples, 0.46%)</title><rect x="1129.9" y="757" width="5.5" height="15.0" fill="rgb(249,33,43)" rx="2" ry="2" />
+<text  x="1132.91" y="767.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ClientConnectionImpl::onBody (2 samples, 0.93%)</title><rect x="496.2" y="661" width="10.9" height="15.0" fill="rgb(205,153,16)" rx="2" ry="2" />
+<text  x="499.20" y="671.5" ></text>
+</g>
+<g >
+<title>BIO_read (1 samples, 0.46%)</title><rect x="479.8" y="677" width="5.5" height="15.0" fill="rgb(252,225,13)" rx="2" ry="2" />
+<text  x="482.81" y="687.5" ></text>
+</g>
+<g >
+<title>Envoy::Upstream::ClusterManagerImpl::ThreadLocalClusterManagerImpl::getHttpConnPoolsContainer (1 samples, 0.46%)</title><rect x="862.2" y="549" width="5.5" height="15.0" fill="rgb(236,132,19)" rx="2" ry="2" />
+<text  x="865.22" y="559.5" ></text>
+</g>
+<g >
+<title>std::__1::__function::__func&lt;Envoy::Extensions::Wasm::MetadataExchange::Plugin::$_0, std::__1::allocator&lt;Envoy::Extensions::Wasm::MetadataExchange::Plugin::$_0&gt;, std::__1::unique_ptr&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::Context, std::__1::default_delete&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::Context&gt; &gt;  (1 samples, 0.46%)</title><rect x="905.9" y="549" width="5.5" height="15.0" fill="rgb(224,15,4)" rx="2" ry="2" />
+<text  x="908.93" y="559.5" ></text>
+</g>
+<g >
+<title>__errno_location (1 samples, 0.46%)</title><rect x="479.8" y="645" width="5.5" height="15.0" fill="rgb(215,83,54)" rx="2" ry="2" />
+<text  x="482.81" y="655.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::dispatchSlice (77 samples, 35.65%)</title><rect x="643.7" y="725" width="420.7" height="15.0" fill="rgb(206,157,34)" rx="2" ry="2" />
+<text  x="646.70" y="735.5" >Envoy::Http::Http1::ConnectionImpl::dispatchSlice</text>
+</g>
+<g >
+<title>Envoy::Router::Filter::UpstreamRequest::decodeData (1 samples, 0.46%)</title><rect x="501.7" y="645" width="5.4" height="15.0" fill="rgb(217,168,4)" rx="2" ry="2" />
+<text  x="504.67" y="655.5" ></text>
+</g>
+<g >
+<title>std::__1::basic_regex&lt;char, std::__1::regex_traits&lt;char&gt; &gt;::__match_at_start_ecma&lt;std::__1::allocator&lt;std::__1::sub_match&lt;char const*&gt; &gt; &gt; (1 samples, 0.46%)</title><rect x="70.1" y="421" width="5.5" height="15.0" fill="rgb(246,103,3)" rx="2" ry="2" />
+<text  x="73.09" y="431.5" ></text>
+</g>
+<g >
+<title>bssl::SSLAEADContext::MaxOverhead (1 samples, 0.46%)</title><rect x="1135.4" y="693" width="5.4" height="15.0" fill="rgb(236,111,54)" rx="2" ry="2" />
+<text  x="1138.37" y="703.5" ></text>
+</g>
+<g >
+<title>operator delete[] (1 samples, 0.46%)</title><rect x="343.2" y="709" width="5.5" height="15.0" fill="rgb(247,31,0)" rx="2" ry="2" />
+<text  x="346.24" y="719.5" ></text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="332.3" y="709" width="5.5" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="335.31" y="719.5" ></text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::PrintField (1 samples, 0.46%)</title><rect x="59.2" y="341" width="5.4" height="15.0" fill="rgb(234,92,18)" rx="2" ry="2" />
+<text  x="62.17" y="351.5" ></text>
+</g>
+<g >
+<title>Envoy::Network::FilterManagerImpl::onContinueReading (6 samples, 2.78%)</title><rect x="59.2" y="741" width="32.7" height="15.0" fill="rgb(220,154,29)" rx="2" ry="2" />
+<text  x="62.17" y="751.5" >En..</text>
+</g>
+<g >
+<title>Envoy::Http::HeaderMapImpl::insertByKey (2 samples, 0.93%)</title><rect x="714.7" y="645" width="10.9" height="15.0" fill="rgb(244,51,37)" rx="2" ry="2" />
+<text  x="717.72" y="655.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::CodeStatsImpl::incCounter (1 samples, 0.46%)</title><rect x="621.9" y="565" width="5.4" height="15.0" fill="rgb(231,136,34)" rx="2" ry="2" />
+<text  x="624.85" y="575.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::newStream (3 samples, 1.39%)</title><rect x="665.6" y="645" width="16.3" height="15.0" fill="rgb(229,15,13)" rx="2" ry="2" />
+<text  x="668.56" y="655.5" ></text>
+</g>
+<g >
+<title>Envoy::Tracing::HttpTracerImpl::startSpan (2 samples, 0.93%)</title><rect x="987.9" y="613" width="10.9" height="15.0" fill="rgb(251,3,2)" rx="2" ry="2" />
+<text  x="990.87" y="623.5" ></text>
+</g>
+<g >
+<title>http_parser_execute (4 samples, 1.85%)</title><rect x="70.1" y="677" width="21.8" height="15.0" fill="rgb(227,174,39)" rx="2" ry="2" />
+<text  x="73.09" y="687.5" >h..</text>
+</g>
+<g >
+<title>bssl::ssl_handle_open_record (1 samples, 0.46%)</title><rect x="479.8" y="709" width="5.5" height="15.0" fill="rgb(228,223,20)" rx="2" ry="2" />
+<text  x="482.81" y="719.5" ></text>
+</g>
+<g >
+<title>operator new[] (1 samples, 0.46%)</title><rect x="234.0" y="661" width="5.4" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="236.98" y="671.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::Filter::getConnPool (1 samples, 0.46%)</title><rect x="1162.7" y="725" width="5.4" height="15.0" fill="rgb(234,145,5)" rx="2" ry="2" />
+<text  x="1165.69" y="735.5" ></text>
+</g>
+<g >
+<title>main (9 samples, 4.17%)</title><rect x="48.2" y="869" width="49.2" height="15.0" fill="rgb(245,7,22)" rx="2" ry="2" />
+<text  x="51.24" y="879.5" >main</text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Exports::set_property (4 samples, 1.85%)</title><rect x="933.2" y="549" width="21.9" height="15.0" fill="rgb(253,187,41)" rx="2" ry="2" />
+<text  x="936.24" y="559.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Network::ConnectionImpl::ioHandle (2 samples, 0.93%)</title><rect x="425.2" y="805" width="10.9" height="15.0" fill="rgb(224,77,13)" rx="2" ry="2" />
+<text  x="428.19" y="815.5" ></text>
+</g>
+<g >
+<title>bssl::ssl3_write_app_data (2 samples, 0.93%)</title><rect x="1135.4" y="741" width="10.9" height="15.0" fill="rgb(214,53,52)" rx="2" ry="2" />
+<text  x="1138.37" y="751.5" ></text>
+</g>
+<g >
+<title>Envoy::Buffer::OwnedImpl::drain (1 samples, 0.46%)</title><rect x="1129.9" y="741" width="5.5" height="15.0" fill="rgb(220,157,5)" rx="2" ry="2" />
+<text  x="1132.91" y="751.5" ></text>
+</g>
+<g >
+<title>std::__1::__function::__func&lt;Envoy::Extensions::Common::Wasm::Null::NullPlugin::getFunction (1 samples, 0.46%)</title><rect x="955.1" y="597" width="5.5" height="15.0" fill="rgb(237,150,51)" rx="2" ry="2" />
+<text  x="958.09" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Server::PrometheusStatsFormatter::metricName (1 samples, 0.46%)</title><rect x="70.1" y="501" width="5.5" height="15.0" fill="rgb(227,58,10)" rx="2" ry="2" />
+<text  x="73.09" y="511.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::getProperty (3 samples, 1.39%)</title><rect x="310.5" y="645" width="16.4" height="15.0" fill="rgb(215,195,21)" rx="2" ry="2" />
+<text  x="313.46" y="655.5" ></text>
+</g>
+<g >
+<title>operator new[] (2 samples, 0.93%)</title><rect x="714.7" y="629" width="10.9" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="717.72" y="639.5" ></text>
+</g>
+<g >
+<title>Envoy::Runtime::runtimeFeatureEnabled (1 samples, 0.46%)</title><rect x="1048.0" y="629" width="5.4" height="15.0" fill="rgb(245,0,52)" rx="2" ry="2" />
+<text  x="1050.96" y="639.5" ></text>
+</g>
+<g >
+<title>epoll_dispatch (5 samples, 2.31%)</title><rect x="157.5" y="837" width="27.3" height="15.0" fill="rgb(211,133,26)" rx="2" ry="2" />
+<text  x="160.50" y="847.5" >e..</text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="1031.6" y="613" width="5.4" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="1034.57" y="623.5" ></text>
+</g>
+<g >
+<title>Envoy::StreamInfo::FilterStateImpl::FilterStateImpl (1 samples, 0.46%)</title><rect x="856.8" y="565" width="5.4" height="15.0" fill="rgb(239,191,3)" rx="2" ry="2" />
+<text  x="859.76" y="575.5" ></text>
+</g>
+<g >
+<title>virtual thunk to Envoy::Http::Http1::ConnectionImpl::protocol (1 samples, 0.46%)</title><rect x="676.5" y="629" width="5.4" height="15.0" fill="rgb(217,133,48)" rx="2" ry="2" />
+<text  x="679.48" y="639.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::StreamDecoderWrapper::decodeHeaders (1 samples, 0.46%)</title><rect x="550.8" y="645" width="5.5" height="15.0" fill="rgb(236,55,3)" rx="2" ry="2" />
+<text  x="553.83" y="655.5" ></text>
+</g>
+<g >
+<title>non-virtual thunk to Envoy::Http::Http1::ServerConnectionImpl::onHeadersComplete (60 samples, 27.78%)</title><rect x="736.6" y="677" width="327.8" height="15.0" fill="rgb(234,7,3)" rx="2" ry="2" />
+<text  x="739.57" y="687.5" >non-virtual thunk to Envoy::Http::Http1::Ser..</text>
+</g>
+<g >
+<title>ssl_read_impl (5 samples, 2.31%)</title><rect x="458.0" y="725" width="27.3" height="15.0" fill="rgb(243,3,47)" rx="2" ry="2" />
+<text  x="460.96" y="735.5" >s..</text>
+</g>
+<g >
+<title>ERR_peek_error (1 samples, 0.46%)</title><rect x="436.1" y="757" width="5.5" height="15.0" fill="rgb(246,114,51)" rx="2" ry="2" />
+<text  x="439.11" y="767.5" ></text>
+</g>
+<g >
+<title>virtual thunk to Envoy::Extensions::Common::Wasm::Context::decodeHeaders (14 samples, 6.48%)</title><rect x="884.1" y="613" width="76.5" height="15.0" fill="rgb(218,161,21)" rx="2" ry="2" />
+<text  x="887.07" y="623.5" >virtual ..</text>
+</g>
+<g >
+<title>std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;::assign (1 samples, 0.46%)</title><rect x="348.7" y="709" width="5.5" height="15.0" fill="rgb(253,43,28)" rx="2" ry="2" />
+<text  x="351.70" y="719.5" ></text>
+</g>
+<g >
+<title>google::protobuf::Struct::Struct (1 samples, 0.46%)</title><rect x="824.0" y="597" width="5.4" height="15.0" fill="rgb(220,181,41)" rx="2" ry="2" />
+<text  x="826.98" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ServerConnectionImpl::onMessageBegin (3 samples, 1.39%)</title><rect x="665.6" y="661" width="16.3" height="15.0" fill="rgb(218,63,15)" rx="2" ry="2" />
+<text  x="668.56" y="671.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::Filter::onUpstreamHeaders (13 samples, 6.02%)</title><rect x="556.3" y="629" width="71.0" height="15.0" fill="rgb(213,224,35)" rx="2" ry="2" />
+<text  x="559.30" y="639.5" >Envoy::R..</text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::PrintField (1 samples, 0.46%)</title><rect x="59.2" y="405" width="5.4" height="15.0" fill="rgb(234,92,18)" rx="2" ry="2" />
+<text  x="62.17" y="415.5" ></text>
+</g>
+<g >
+<title>event_process_active_single_queue (181 samples, 83.80%)</title><rect x="190.3" y="837" width="988.8" height="15.0" fill="rgb(209,50,14)" rx="2" ry="2" />
+<text  x="193.28" y="847.5" >event_process_active_single_queue</text>
+</g>
+<g >
+<title>std::__1::__bracket_expression&lt;char, std::__1::regex_traits&lt;char&gt; &gt;::__exec (1 samples, 0.46%)</title><rect x="70.1" y="405" width="5.5" height="15.0" fill="rgb(240,4,25)" rx="2" ry="2" />
+<text  x="73.09" y="415.5" ></text>
+</g>
+<g >
+<title>Envoy::Event::FileEventImpl::setEnabled (2 samples, 0.93%)</title><rect x="1069.8" y="725" width="10.9" height="15.0" fill="rgb(206,97,47)" rx="2" ry="2" />
+<text  x="1072.81" y="735.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::~ActiveStream (42 samples, 19.44%)</title><rect x="195.7" y="805" width="229.5" height="15.0" fill="rgb(244,133,45)" rx="2" ry="2" />
+<text  x="198.74" y="815.5" >Envoy::Http::ConnectionManager..</text>
+</g>
+<g >
+<title>Envoy::Server::PrometheusStatsFormatter::sanitizeName (1 samples, 0.46%)</title><rect x="70.1" y="485" width="5.5" height="15.0" fill="rgb(215,117,30)" rx="2" ry="2" />
+<text  x="73.09" y="495.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::~ActiveStream (1 samples, 0.46%)</title><rect x="53.7" y="757" width="5.5" height="15.0" fill="rgb(244,133,45)" rx="2" ry="2" />
+<text  x="56.70" y="767.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Exports::get_header_map_value (1 samples, 0.46%)</title><rect x="589.1" y="533" width="5.4" height="15.0" fill="rgb(229,198,49)" rx="2" ry="2" />
+<text  x="592.07" y="543.5" ></text>
+</g>
+<g >
+<title>google::protobuf::DynamicMessageFactory::GetPrototypeNoLock (1 samples, 0.46%)</title><rect x="59.2" y="85" width="5.4" height="15.0" fill="rgb(216,214,50)" rx="2" ry="2" />
+<text  x="62.17" y="95.5" ></text>
+</g>
+<g >
+<title>Envoy::Buffer::OwnedImpl::move (1 samples, 0.46%)</title><rect x="1091.7" y="693" width="5.4" height="15.0" fill="rgb(244,178,15)" rx="2" ry="2" />
+<text  x="1094.67" y="703.5" ></text>
+</g>
+<g >
+<title>google::protobuf::internal::MapFieldLite&lt;google::protobuf::Struct_FieldsEntry_DoNotUse, std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, google::protobuf::Value,  (3 samples, 1.39%)</title><rect x="796.7" y="565" width="16.4" height="15.0" fill="rgb(209,222,7)" rx="2" ry="2" />
+<text  x="799.67" y="575.5" ></text>
+</g>
+<g >
+<title>Envoy::Server::ListenerManagerImpl::addOrUpdateListenerInternal (1 samples, 0.46%)</title><rect x="59.2" y="485" width="5.4" height="15.0" fill="rgb(212,115,19)" rx="2" ry="2" />
+<text  x="62.17" y="495.5" ></text>
+</g>
+<g >
+<title>Envoy::Network::ConnectionImpl::write (1 samples, 0.46%)</title><rect x="1091.7" y="725" width="5.4" height="15.0" fill="rgb(219,44,25)" rx="2" ry="2" />
+<text  x="1094.67" y="735.5" ></text>
+</g>
+<g >
+<title>bssl::tls_flush_pending_hs_data (1 samples, 0.46%)</title><rect x="1140.8" y="709" width="5.5" height="15.0" fill="rgb(248,58,50)" rx="2" ry="2" />
+<text  x="1143.83" y="719.5" ></text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::Print (1 samples, 0.46%)</title><rect x="59.2" y="389" width="5.4" height="15.0" fill="rgb(238,206,35)" rx="2" ry="2" />
+<text  x="62.17" y="399.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Exports::record_metric (1 samples, 0.46%)</title><rect x="217.6" y="709" width="5.5" height="15.0" fill="rgb(253,22,29)" rx="2" ry="2" />
+<text  x="220.59" y="719.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::CodecClient::deleteRequest (1 samples, 0.46%)</title><rect x="507.1" y="597" width="5.5" height="15.0" fill="rgb(212,218,49)" rx="2" ry="2" />
+<text  x="510.13" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ServerConnectionImpl::onMessageComplete (1 samples, 0.46%)</title><rect x="731.1" y="661" width="5.5" height="15.0" fill="rgb(230,216,50)" rx="2" ry="2" />
+<text  x="734.11" y="671.5" ></text>
+</g>
+<g >
+<title>_aesni_ctr32_ghash_6x (1 samples, 0.46%)</title><rect x="119.3" y="901" width="5.4" height="15.0" fill="rgb(231,221,45)" rx="2" ry="2" />
+<text  x="122.26" y="911.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::TransportSockets::Tls::Utility::getSubjectAltNames (3 samples, 1.39%)</title><rect x="1004.3" y="581" width="16.3" height="15.0" fill="rgb(249,116,43)" rx="2" ry="2" />
+<text  x="1007.26" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase::onDelete (1 samples, 0.46%)</title><rect x="365.1" y="757" width="5.5" height="15.0" fill="rgb(207,221,7)" rx="2" ry="2" />
+<text  x="368.09" y="767.5" ></text>
+</g>
+<g >
+<title>Envoy::Buffer::OwnedImpl::drain (1 samples, 0.46%)</title><rect x="638.2" y="725" width="5.5" height="15.0" fill="rgb(220,157,5)" rx="2" ry="2" />
+<text  x="641.24" y="735.5" ></text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="1015.2" y="549" width="5.4" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="1018.19" y="559.5" ></text>
+</g>
+<g >
+<title>istio::authn::X509Payload::~X509Payload (1 samples, 0.46%)</title><rect x="834.9" y="597" width="5.5" height="15.0" fill="rgb(232,183,41)" rx="2" ry="2" />
+<text  x="837.91" y="607.5" ></text>
+</g>
+<g >
+<title>std::__1::shared_ptr&lt;Envoy::StreamInfo::FilterStateImpl&gt;::make_shared&lt;std::__1::shared_ptr&lt;Envoy::StreamInfo::FilterState&gt;&amp;, Envoy::StreamInfo::FilterState::LifeSpan&gt; (1 samples, 0.46%)</title><rect x="856.8" y="533" width="5.4" height="15.0" fill="rgb(210,161,5)" rx="2" ry="2" />
+<text  x="859.76" y="543.5" ></text>
+</g>
+<g >
+<title>bssl::do_ssl3_write (2 samples, 0.93%)</title><rect x="1135.4" y="725" width="10.9" height="15.0" fill="rgb(221,226,44)" rx="2" ry="2" />
+<text  x="1138.37" y="735.5" ></text>
+</g>
+<g >
+<title>http_parser_execute (77 samples, 35.65%)</title><rect x="643.7" y="709" width="420.7" height="15.0" fill="rgb(227,174,39)" rx="2" ry="2" />
+<text  x="646.70" y="719.5" >http_parser_execute</text>
+</g>
+<g >
+<title>event_del_nolock_ (2 samples, 0.93%)</title><rect x="1069.8" y="693" width="10.9" height="15.0" fill="rgb(224,169,15)" rx="2" ry="2" />
+<text  x="1072.81" y="703.5" ></text>
+</g>
+<g >
+<title>event_base_loop (194 samples, 89.81%)</title><rect x="124.7" y="853" width="1059.8" height="15.0" fill="rgb(243,150,38)" rx="2" ry="2" />
+<text  x="127.72" y="863.5" >event_base_loop</text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::doEndStream (2 samples, 0.93%)</title><rect x="512.6" y="565" width="10.9" height="15.0" fill="rgb(221,72,47)" rx="2" ry="2" />
+<text  x="515.59" y="575.5" ></text>
+</g>
+<g >
+<title>__clock_gettime (1 samples, 0.46%)</title><rect x="15.5" y="837" width="5.4" height="15.0" fill="rgb(219,172,40)" rx="2" ry="2" />
+<text  x="18.46" y="847.5" ></text>
+</g>
+<g >
+<title>Envoy::Config::GrpcMuxSubscriptionImpl::onConfigUpdate (2 samples, 0.93%)</title><rect x="59.2" y="549" width="10.9" height="15.0" fill="rgb(224,119,19)" rx="2" ry="2" />
+<text  x="62.17" y="559.5" ></text>
+</g>
+<g >
+<title>operator new[] (1 samples, 0.46%)</title><rect x="949.6" y="517" width="5.5" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="952.63" y="527.5" ></text>
+</g>
+<g >
+<title>start_thread (195 samples, 90.28%)</title><rect x="124.7" y="901" width="1065.3" height="15.0" fill="rgb(254,142,1)" rx="2" ry="2" />
+<text  x="127.72" y="911.5" >start_thread</text>
+</g>
+<g >
+<title>event_process_active_single_queue (8 samples, 3.70%)</title><rect x="53.7" y="805" width="43.7" height="15.0" fill="rgb(209,50,14)" rx="2" ry="2" />
+<text  x="56.70" y="815.5" >even..</text>
+</g>
+<g >
+<title>absl::container_internal::raw_hash_set&lt;absl::container_internal::FlatHashMapPolicy&lt;unsigned int, Envoy::Extensions::Common::Wasm::Context*&gt;, absl::hash_internal::Hash&lt;unsigned int&gt;, std::__1::equal_to&lt;unsigned int&gt;, std::__1::allocator&lt;std::__1::pair&lt;unsigned int const, Envoy::Extensions::Common::Wasm::Context*&gt; &gt; &gt;::erase&lt;unsigned int&gt; (1 samples, 0.46%)</title><rect x="376.0" y="757" width="5.5" height="15.0" fill="rgb(245,207,13)" rx="2" ry="2" />
+<text  x="379.02" y="767.5" ></text>
+</g>
+<g >
+<title>envoy::api::v2::core::Metadata::~Metadata (2 samples, 0.93%)</title><rect x="529.0" y="517" width="10.9" height="15.0" fill="rgb(222,125,46)" rx="2" ry="2" />
+<text  x="531.98" y="527.5" ></text>
+</g>
+<g >
+<title>OBJ_obj2nid (1 samples, 0.46%)</title><rect x="1009.7" y="549" width="5.5" height="15.0" fill="rgb(237,31,28)" rx="2" ry="2" />
+<text  x="1012.72" y="559.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::HeaderMapImpl::byteSize (1 samples, 0.46%)</title><rect x="725.6" y="677" width="5.5" height="15.0" fill="rgb(239,136,44)" rx="2" ry="2" />
+<text  x="728.65" y="687.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::HeaderMapImpl::Path (1 samples, 0.46%)</title><rect x="1058.9" y="645" width="5.5" height="15.0" fill="rgb(205,111,36)" rx="2" ry="2" />
+<text  x="1061.89" y="655.5" ></text>
+</g>
+<g >
+<title>operator new[] (1 samples, 0.46%)</title><rect x="807.6" y="549" width="5.5" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="810.59" y="559.5" ></text>
+</g>
+<g >
+<title>Envoy::ThreadLocal::InstanceImpl::Bookkeeper::get (1 samples, 0.46%)</title><rect x="976.9" y="581" width="5.5" height="15.0" fill="rgb(235,211,48)" rx="2" ry="2" />
+<text  x="979.94" y="591.5" ></text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="671.0" y="613" width="5.5" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="674.02" y="623.5" ></text>
+</g>
+<g >
+<title>google::protobuf::DynamicMessageFactory::GetPrototype (1 samples, 0.46%)</title><rect x="59.2" y="197" width="5.4" height="15.0" fill="rgb(210,93,6)" rx="2" ry="2" />
+<text  x="62.17" y="207.5" ></text>
+</g>
+<g >
+<title>std::__1::__shared_ptr_emplace&lt;Envoy::Extensions::HttpFilters::HealthCheck::HealthCheckFilter, std::__1::allocator&lt;Envoy::Extensions::HttpFilters::HealthCheck::HealthCheckFilter&gt; &gt;::__on_zero_shared (1 samples, 0.46%)</title><rect x="419.7" y="773" width="5.5" height="15.0" fill="rgb(215,188,20)" rx="2" ry="2" />
+<text  x="422.72" y="783.5" ></text>
+</g>
+<g >
+<title>Envoy::Buffer::OwnedImpl::length (1 samples, 0.46%)</title><rect x="501.7" y="629" width="5.4" height="15.0" fill="rgb(239,124,53)" rx="2" ry="2" />
+<text  x="504.67" y="639.5" ></text>
+</g>
+<g >
+<title>std::__1::basic_regex&lt;char, std::__1::regex_traits&lt;char&gt; &gt;::__match_at_start_ecma&lt;std::__1::allocator&lt;std::__1::sub_match&lt;char const*&gt; &gt; &gt; (2 samples, 0.93%)</title><rect x="75.6" y="485" width="10.9" height="15.0" fill="rgb(246,103,3)" rx="2" ry="2" />
+<text  x="78.56" y="495.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Exports::get_header_map_value (1 samples, 0.46%)</title><rect x="283.1" y="693" width="5.5" height="15.0" fill="rgb(229,198,49)" rx="2" ry="2" />
+<text  x="286.15" y="703.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Tracers::Zipkin::Span::setTag (1 samples, 0.46%)</title><rect x="397.9" y="757" width="5.4" height="15.0" fill="rgb(246,106,52)" rx="2" ry="2" />
+<text  x="400.87" y="767.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::addStreamEncoderFilterWorker (1 samples, 0.46%)</title><rect x="742.0" y="565" width="5.5" height="15.0" fill="rgb(210,75,17)" rx="2" ry="2" />
+<text  x="745.04" y="575.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::decodeData (1 samples, 0.46%)</title><rect x="731.1" y="645" width="5.5" height="15.0" fill="rgb(235,192,15)" rx="2" ry="2" />
+<text  x="734.11" y="655.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::addStreamFilter (1 samples, 0.46%)</title><rect x="742.0" y="581" width="5.5" height="15.0" fill="rgb(247,72,18)" rx="2" ry="2" />
+<text  x="745.04" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStreamFilterBase::scope (1 samples, 0.46%)</title><rect x="545.4" y="645" width="5.4" height="15.0" fill="rgb(213,90,33)" rx="2" ry="2" />
+<text  x="548.37" y="655.5" ></text>
+</g>
+<g >
+<title>Envoy::Upstream::ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry::connPool (1 samples, 0.46%)</title><rect x="1162.7" y="693" width="5.4" height="15.0" fill="rgb(216,105,39)" rx="2" ry="2" />
+<text  x="1165.69" y="703.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::HeaderMapImpl::appendForwardedClientCert (1 samples, 0.46%)</title><rect x="1026.1" y="597" width="5.5" height="15.0" fill="rgb(230,168,48)" rx="2" ry="2" />
+<text  x="1029.11" y="607.5" ></text>
+</g>
+<g >
+<title>EVP_AEAD_CTX_open (3 samples, 1.39%)</title><rect x="463.4" y="661" width="16.4" height="15.0" fill="rgb(236,211,20)" rx="2" ry="2" />
+<text  x="466.43" y="671.5" ></text>
+</g>
+<g >
+<title>std::__1::regex_iterator&lt;std::__1::__wrap_iter&lt;char const*&gt;, char, std::__1::regex_traits&lt;char&gt; &gt;::operator++ (1 samples, 0.46%)</title><rect x="70.1" y="453" width="5.5" height="15.0" fill="rgb(238,219,36)" rx="2" ry="2" />
+<text  x="73.09" y="463.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::CodeStatsImpl::chargeResponseTiming (1 samples, 0.46%)</title><rect x="523.5" y="565" width="5.5" height="15.0" fill="rgb(232,143,25)" rx="2" ry="2" />
+<text  x="526.52" y="575.5" ></text>
+</g>
+<g >
+<title>google::protobuf::Map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, google::protobuf::Value&gt;::~Map (1 samples, 0.46%)</title><rect x="829.4" y="581" width="5.5" height="15.0" fill="rgb(215,105,34)" rx="2" ry="2" />
+<text  x="832.44" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::setProperty (4 samples, 1.85%)</title><rect x="933.2" y="533" width="21.9" height="15.0" fill="rgb(223,106,30)" rx="2" ry="2" />
+<text  x="936.24" y="543.5" >E..</text>
+</g>
+<g >
+<title>google::protobuf::Map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, google::protobuf::Value&gt;::operator[] (2 samples, 0.93%)</title><rect x="796.7" y="549" width="10.9" height="15.0" fill="rgb(253,182,54)" rx="2" ry="2" />
+<text  x="799.67" y="559.5" ></text>
+</g>
+<g >
+<title>Envoy::ThreadLocal::Slot::getTyped&lt;Envoy::Extensions::Common::Wasm::WasmHandle&gt; (1 samples, 0.46%)</title><rect x="736.6" y="597" width="5.4" height="15.0" fill="rgb(235,173,19)" rx="2" ry="2" />
+<text  x="739.57" y="607.5" ></text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::Print (1 samples, 0.46%)</title><rect x="59.2" y="229" width="5.4" height="15.0" fill="rgb(238,206,35)" rx="2" ry="2" />
+<text  x="62.17" y="239.5" ></text>
+</g>
+<g >
+<title>event_base_loop (9 samples, 4.17%)</title><rect x="48.2" y="821" width="49.2" height="15.0" fill="rgb(243,150,38)" rx="2" ry="2" />
+<text  x="51.24" y="831.5" >even..</text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Exports::get_property (3 samples, 1.39%)</title><rect x="310.5" y="661" width="16.4" height="15.0" fill="rgb(227,14,17)" rx="2" ry="2" />
+<text  x="313.46" y="671.5" ></text>
+</g>
+<g >
+<title>Envoy::Server::AdminImpl::handlerPrometheusStats (1 samples, 0.46%)</title><rect x="70.1" y="533" width="5.5" height="15.0" fill="rgb(219,196,49)" rx="2" ry="2" />
+<text  x="73.09" y="543.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::HeaderMapImpl::addViaMove (7 samples, 3.24%)</title><rect x="687.4" y="661" width="38.2" height="15.0" fill="rgb(239,128,5)" rx="2" ry="2" />
+<text  x="690.41" y="671.5" >Env..</text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::$_8::__invoke (6 samples, 2.78%)</title><rect x="507.1" y="677" width="32.8" height="15.0" fill="rgb(234,36,14)" rx="2" ry="2" />
+<text  x="510.13" y="687.5" >En..</text>
+</g>
+<g >
+<title>Envoy::Http::StreamDecoderWrapper::decodeData (6 samples, 2.78%)</title><rect x="507.1" y="629" width="32.8" height="15.0" fill="rgb(248,164,21)" rx="2" ry="2" />
+<text  x="510.13" y="639.5" >En..</text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerUtility::mutateXfccRequestHeader (5 samples, 2.31%)</title><rect x="1004.3" y="613" width="27.3" height="15.0" fill="rgb(254,189,0)" rx="2" ry="2" />
+<text  x="1007.26" y="623.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ServerConnectionImpl::onHeadersComplete (60 samples, 27.78%)</title><rect x="736.6" y="661" width="327.8" height="15.0" fill="rgb(247,161,6)" rx="2" ry="2" />
+<text  x="739.57" y="671.5" >Envoy::Http::Http1::ServerConnectionImpl::on..</text>
+</g>
+<g >
+<title>Envoy::(anonymous namespace)::decodeBase (2 samples, 0.93%)</title><rect x="911.4" y="533" width="10.9" height="15.0" fill="rgb(242,67,25)" rx="2" ry="2" />
+<text  x="914.39" y="543.5" ></text>
+</g>
+<g >
+<title>google::protobuf::Struct::~Struct (2 samples, 0.93%)</title><rect x="381.5" y="725" width="10.9" height="15.0" fill="rgb(224,41,34)" rx="2" ry="2" />
+<text  x="384.48" y="735.5" ></text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="223.1" y="693" width="5.4" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="226.06" y="703.5" ></text>
+</g>
+<g >
+<title>Envoy::ThreadLocal::Slot::getTyped&lt;Envoy::Upstream::ClusterManagerImpl::ThreadLocalClusterManagerImpl&gt; (2 samples, 0.93%)</title><rect x="971.5" y="597" width="10.9" height="15.0" fill="rgb(253,101,54)" rx="2" ry="2" />
+<text  x="974.48" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::AsyncClientImpl::send (1 samples, 0.46%)</title><rect x="1162.7" y="789" width="5.4" height="15.0" fill="rgb(230,182,22)" rx="2" ry="2" />
+<text  x="1165.69" y="799.5" ></text>
+</g>
+<g >
+<title>google::protobuf::internal::ArenaImpl::ArenaImpl&lt;google::protobuf::ArenaOptions&gt; (1 samples, 0.46%)</title><rect x="305.0" y="645" width="5.5" height="15.0" fill="rgb(213,12,19)" rx="2" ry="2" />
+<text  x="308.00" y="655.5" ></text>
+</g>
+<g >
+<title>operator delete[] (1 samples, 0.46%)</title><rect x="326.9" y="677" width="5.4" height="15.0" fill="rgb(247,31,0)" rx="2" ry="2" />
+<text  x="329.85" y="687.5" ></text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::Print (1 samples, 0.46%)</title><rect x="59.2" y="325" width="5.4" height="15.0" fill="rgb(238,206,35)" rx="2" ry="2" />
+<text  x="62.17" y="335.5" ></text>
+</g>
+<g >
+<title>Envoy::Tcp::ConnPoolImpl::ConnReadFilter::onData (1 samples, 0.46%)</title><rect x="1091.7" y="757" width="5.4" height="15.0" fill="rgb(244,153,22)" rx="2" ry="2" />
+<text  x="1094.67" y="767.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::onHeadersCompleteBase (16 samples, 7.41%)</title><rect x="539.9" y="677" width="87.4" height="15.0" fill="rgb(242,167,27)" rx="2" ry="2" />
+<text  x="542.91" y="687.5" >Envoy::Htt..</text>
+</g>
+<g >
+<title>std::__1::__function::__func&lt;Envoy::Extensions::Common::Wasm::Null::NullPlugin::getFunction (4 samples, 1.85%)</title><rect x="889.5" y="565" width="21.9" height="15.0" fill="rgb(237,150,51)" rx="2" ry="2" />
+<text  x="892.54" y="575.5" >s..</text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="272.2" y="693" width="5.5" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="275.22" y="703.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Null::Plugin::Stats::IstioDimensions::debug_key (1 samples, 0.46%)</title><rect x="223.1" y="709" width="5.4" height="15.0" fill="rgb(245,3,26)" rx="2" ry="2" />
+<text  x="226.06" y="719.5" ></text>
+</g>
+<g >
+<title>std::__1::__function::__func&lt;Envoy::Extensions::HttpFilters::Wasm::WasmFilterConfig::createFilterFactoryFromProtoTyped (2 samples, 0.93%)</title><rect x="753.0" y="597" width="10.9" height="15.0" fill="rgb(214,141,15)" rx="2" ry="2" />
+<text  x="755.96" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::StreamInfo::StreamInfoImpl::requestComplete (1 samples, 0.46%)</title><rect x="53.7" y="693" width="5.5" height="15.0" fill="rgb(213,40,22)" rx="2" ry="2" />
+<text  x="56.70" y="703.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::AsyncStreamImpl::sendHeaders (1 samples, 0.46%)</title><rect x="1162.7" y="757" width="5.4" height="15.0" fill="rgb(251,138,17)" rx="2" ry="2" />
+<text  x="1165.69" y="767.5" ></text>
+</g>
+<g >
+<title>std::__1::__hash_table&lt;std::__1::__hash_value_type&lt;long, std::__1::unique_ptr&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase, std::__1::default_delete&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase&gt; &gt; &gt;, std::__1::__unordered_map_hasher&lt;long, std::__1::__hash_value_type&lt;long, std::__1::unique_ptr&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase, std::__1::default_delete&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase&gt; &gt; &gt;, std::__1::hash&lt;long&gt;, true&gt;, std::__1::__unordered_map_equal&lt;long, std::__1::__hash_value_type&lt;long, std::__1::unique_ptr&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase, std::__1::default_delete&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase&gt; &gt; &gt;, std::__1::equal_to&lt;long&gt;, true&gt;, std::__1::allocator&lt;std::__1::__hash_value_type&lt;long, std::__1::unique_ptr&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase, std::__1::default_delete&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase&gt; &gt; &gt; &gt; &gt;::__node_insert_unique_prepare (1 samples, 0.46%)</title><rect x="895.0" y="517" width="5.5" height="15.0" fill="rgb(215,117,38)" rx="2" ry="2" />
+<text  x="898.00" y="527.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::HeaderMapImpl::setReferenceScheme (2 samples, 0.93%)</title><rect x="769.4" y="613" width="10.9" height="15.0" fill="rgb(239,71,28)" rx="2" ry="2" />
+<text  x="772.35" y="623.5" ></text>
+</g>
+<g >
+<title>std::__1::__compressed_pair_elem&lt;Envoy::StreamInfo::FilterStateImpl, 1, false&gt;::__compressed_pair_elem&lt;std::__1::shared_ptr&lt;Envoy::StreamInfo::FilterState&gt;&amp;, Envoy::StreamInfo::FilterState::LifeSpan&amp;&amp;, 0ul, 1ul&gt; (1 samples, 0.46%)</title><rect x="856.8" y="517" width="5.4" height="15.0" fill="rgb(244,179,23)" rx="2" ry="2" />
+<text  x="859.76" y="527.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::decodeHeaders (59 samples, 27.31%)</title><rect x="736.6" y="645" width="322.3" height="15.0" fill="rgb(224,144,33)" rx="2" ry="2" />
+<text  x="739.57" y="655.5" >Envoy::Http::ConnectionManagerImpl::ActiveS..</text>
+</g>
+<g >
+<title>google::protobuf::Struct::~Struct (1 samples, 0.46%)</title><rect x="392.4" y="741" width="5.5" height="15.0" fill="rgb(224,41,34)" rx="2" ry="2" />
+<text  x="395.41" y="751.5" ></text>
+</g>
+<g >
+<title>__pthread_enable_asynccancel (1 samples, 0.46%)</title><rect x="102.9" y="885" width="5.4" height="15.0" fill="rgb(224,98,5)" rx="2" ry="2" />
+<text  x="105.87" y="895.5" ></text>
+</g>
+<g >
+<title>event_callback_activate_nolock_ (1 samples, 0.46%)</title><rect x="184.8" y="837" width="5.5" height="15.0" fill="rgb(234,174,48)" rx="2" ry="2" />
+<text  x="187.81" y="847.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::getHeaderMapValue (1 samples, 0.46%)</title><rect x="922.3" y="533" width="5.5" height="15.0" fill="rgb(242,200,48)" rx="2" ry="2" />
+<text  x="925.31" y="543.5" ></text>
+</g>
+<g >
+<title>evmap_io_del_ (1 samples, 0.46%)</title><rect x="1075.3" y="677" width="5.4" height="15.0" fill="rgb(246,0,35)" rx="2" ry="2" />
+<text  x="1078.28" y="687.5" ></text>
+</g>
+<g >
+<title>google::protobuf::Value::clear_kind (1 samples, 0.46%)</title><rect x="381.5" y="677" width="5.4" height="15.0" fill="rgb(228,173,35)" rx="2" ry="2" />
+<text  x="384.48" y="687.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::Filter::onUpstreamComplete (3 samples, 1.39%)</title><rect x="523.5" y="581" width="16.4" height="15.0" fill="rgb(209,94,9)" rx="2" ry="2" />
+<text  x="526.52" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Exports::get_property (4 samples, 1.85%)</title><rect x="288.6" y="677" width="21.9" height="15.0" fill="rgb(227,14,17)" rx="2" ry="2" />
+<text  x="291.61" y="687.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Network::TransportSocketOptionsUtility::fromFilterState (1 samples, 0.46%)</title><rect x="845.8" y="597" width="5.5" height="15.0" fill="rgb(223,27,46)" rx="2" ry="2" />
+<text  x="848.83" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::StreamInfo::FilterStateImpl::setData (3 samples, 1.39%)</title><rect x="933.2" y="517" width="16.4" height="15.0" fill="rgb(212,17,8)" rx="2" ry="2" />
+<text  x="936.24" y="527.5" ></text>
+</g>
+<g >
+<title>operator delete[] (1 samples, 0.46%)</title><rect x="627.3" y="709" width="5.5" height="15.0" fill="rgb(247,31,0)" rx="2" ry="2" />
+<text  x="630.31" y="719.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStreamFilterBase::commonHandleAfterHeadersCallback (1 samples, 0.46%)</title><rect x="763.9" y="613" width="5.5" height="15.0" fill="rgb(227,0,52)" rx="2" ry="2" />
+<text  x="766.89" y="623.5" ></text>
+</g>
+<g >
+<title>google::protobuf::internal::ArenaImpl::SerialArena::AddCleanupFallback (1 samples, 0.46%)</title><rect x="310.5" y="597" width="5.4" height="15.0" fill="rgb(223,21,23)" rx="2" ry="2" />
+<text  x="313.46" y="607.5" ></text>
+</g>
+<g >
+<title>std::__1::__function::__func&lt;Envoy::Extensions::Common::Wasm::Null::NullPlugin::getFunction (1 samples, 0.46%)</title><rect x="600.0" y="581" width="5.5" height="15.0" fill="rgb(237,150,51)" rx="2" ry="2" />
+<text  x="603.00" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Buffer::OwnedImpl::length (1 samples, 0.46%)</title><rect x="1119.0" y="773" width="5.4" height="15.0" fill="rgb(239,124,53)" rx="2" ry="2" />
+<text  x="1121.98" y="783.5" ></text>
+</g>
+<g >
+<title>std::__1::__hash_table&lt;std::__1::__hash_value_type&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::shared_ptr&lt;wasm::common::NodeInfo const&gt; &gt;, std::__1::__unordered_map_hasher&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::__hash_value_type&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::shared_ptr&lt;wasm::common::NodeInfo const&gt; &gt;, std::__1::hash&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;, true&gt;, std::__1::__unordered_map_equal&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::__hash_value_type&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::shared_ptr&lt;wasm::common::NodeInfo const&gt; &gt;, std::__1::equal_to&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;, true&gt;, std::__1::allocator&lt;std::__1::__hash_value_type&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::shared_ptr&lt;wasm::common::NodeInfo const&gt; &gt; &gt; &gt;::find&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt; (1 samples, 0.46%)</title><rect x="277.7" y="693" width="5.4" height="15.0" fill="rgb(245,54,14)" rx="2" ry="2" />
+<text  x="280.69" y="703.5" ></text>
+</g>
+<g >
+<title>Envoy::AccessLog::FormatterImpl::format (1 samples, 0.46%)</title><rect x="53.7" y="725" width="5.5" height="15.0" fill="rgb(207,87,38)" rx="2" ry="2" />
+<text  x="56.70" y="735.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::decodeHeaders (4 samples, 1.85%)</title><rect x="70.1" y="597" width="21.8" height="15.0" fill="rgb(224,144,33)" rx="2" ry="2" />
+<text  x="73.09" y="607.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Network::ConnectionImpl::onFileEvent (132 samples, 61.11%)</title><rect x="436.1" y="805" width="721.1" height="15.0" fill="rgb(214,194,0)" rx="2" ry="2" />
+<text  x="439.11" y="815.5" >Envoy::Network::ConnectionImpl::onFileEvent</text>
+</g>
+<g >
+<title>CRYPTO_refcount_inc (1 samples, 0.46%)</title><rect x="294.1" y="581" width="5.4" height="15.0" fill="rgb(207,117,7)" rx="2" ry="2" />
+<text  x="297.07" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Buffer::WatermarkBuffer::reserve (1 samples, 0.46%)</title><rect x="572.7" y="581" width="5.4" height="15.0" fill="rgb(252,190,41)" rx="2" ry="2" />
+<text  x="575.69" y="591.5" ></text>
+</g>
+<g >
+<title>[libc-2.27.so] (3 samples, 1.39%)</title><rect x="239.4" y="693" width="16.4" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="242.44" y="703.5" ></text>
+</g>
+<g >
+<title>bssl::ssl3_open_app_data (4 samples, 1.85%)</title><rect x="458.0" y="709" width="21.8" height="15.0" fill="rgb(228,145,12)" rx="2" ry="2" />
+<text  x="460.96" y="719.5" >b..</text>
+</g>
+<g >
+<title>google::protobuf::Map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, google::protobuf::Struct&gt;::~Map (2 samples, 0.93%)</title><rect x="529.0" y="501" width="10.9" height="15.0" fill="rgb(217,131,20)" rx="2" ry="2" />
+<text  x="531.98" y="511.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::Filter::UpstreamRequest::~UpstreamRequest (2 samples, 0.93%)</title><rect x="529.0" y="565" width="10.9" height="15.0" fill="rgb(222,119,44)" rx="2" ry="2" />
+<text  x="531.98" y="575.5" ></text>
+</g>
+<g >
+<title>Envoy::Tracing::HttpTracerUtility::finalizeDownstreamSpan (4 samples, 1.85%)</title><rect x="397.9" y="773" width="21.8" height="15.0" fill="rgb(251,87,51)" rx="2" ry="2" />
+<text  x="400.87" y="783.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::$_4::__invoke (7 samples, 3.24%)</title><rect x="687.4" y="693" width="38.2" height="15.0" fill="rgb(238,77,10)" rx="2" ry="2" />
+<text  x="690.41" y="703.5" >Env..</text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::Print (1 samples, 0.46%)</title><rect x="59.2" y="421" width="5.4" height="15.0" fill="rgb(238,206,35)" rx="2" ry="2" />
+<text  x="62.17" y="431.5" ></text>
+</g>
+<g >
+<title>Envoy::Stats::ThreadLocalStoreImpl::ScopeImpl::histogramFromStatName (1 samples, 0.46%)</title><rect x="523.5" y="549" width="5.5" height="15.0" fill="rgb(251,58,34)" rx="2" ry="2" />
+<text  x="526.52" y="559.5" ></text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::PrintField (1 samples, 0.46%)</title><rect x="59.2" y="373" width="5.4" height="15.0" fill="rgb(234,92,18)" rx="2" ry="2" />
+<text  x="62.17" y="383.5" ></text>
+</g>
+<g >
+<title>absl::container_internal::raw_hash_set&lt;absl::container_internal::FlatHashMapPolicy&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::unique_ptr&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject, std::__1::default_delete&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject&gt; &gt; &gt;, absl::container_internal::StringHash, absl::container_internal::StringHashEq::Eq, std::__1::allocator&lt;std::__1::pair&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; const, std::__1::unique_ptr&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject, std::__1::default_delete&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject&gt; &gt; &gt; &gt; &gt;::prepare_insert (2 samples, 0.93%)</title><rect x="933.2" y="469" width="11.0" height="15.0" fill="rgb(232,178,52)" rx="2" ry="2" />
+<text  x="936.24" y="479.5" ></text>
+</g>
+<g >
+<title>std::__1::basic_regex&lt;char, std::__1::regex_traits&lt;char&gt; &gt;::__search&lt;std::__1::allocator&lt;std::__1::sub_match&lt;char const*&gt; &gt; &gt; (2 samples, 0.93%)</title><rect x="75.6" y="501" width="10.9" height="15.0" fill="rgb(238,198,3)" rx="2" ry="2" />
+<text  x="78.56" y="511.5" ></text>
+</g>
+<g >
+<title>std::__1::__function::__func&lt;Envoy::Extensions::Common::Wasm::Null::NullPlugin::getFunction (8 samples, 3.70%)</title><rect x="911.4" y="581" width="43.7" height="15.0" fill="rgb(237,150,51)" rx="2" ry="2" />
+<text  x="914.39" y="591.5" >std:..</text>
+</g>
+<g >
+<title>Envoy::Http::StreamDecoderWrapper::decodeData (5 samples, 2.31%)</title><rect x="512.6" y="613" width="27.3" height="15.0" fill="rgb(248,164,21)" rx="2" ry="2" />
+<text  x="515.59" y="623.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Extensions::HttpFilters::HealthCheck::HealthCheckFilter::setDecoderFilterCallbacks (1 samples, 0.46%)</title><rect x="747.5" y="565" width="5.5" height="15.0" fill="rgb(225,1,18)" rx="2" ry="2" />
+<text  x="750.50" y="575.5" ></text>
+</g>
+<g >
+<title>std::__1::__murmur2_or_cityhash&lt;unsigned long, 64ul&gt;::operator (1 samples, 0.46%)</title><rect x="900.5" y="533" width="5.4" height="15.0" fill="rgb(247,12,19)" rx="2" ry="2" />
+<text  x="903.46" y="543.5" ></text>
+</g>
+<g >
+<title>Wasm::Common::NodeInfoCache::getPeerById (5 samples, 2.31%)</title><rect x="255.8" y="709" width="27.3" height="15.0" fill="rgb(249,73,21)" rx="2" ry="2" />
+<text  x="258.83" y="719.5" >W..</text>
+</g>
+<g >
+<title>bssl::SSLAEADContext::Open (4 samples, 1.85%)</title><rect x="458.0" y="677" width="21.8" height="15.0" fill="rgb(233,223,40)" rx="2" ry="2" />
+<text  x="460.96" y="687.5" >b..</text>
+</g>
+<g >
+<title>Envoy::Http::HeaderMapImpl::Path (1 samples, 0.46%)</title><rect x="321.4" y="629" width="5.5" height="15.0" fill="rgb(205,111,36)" rx="2" ry="2" />
+<text  x="324.39" y="639.5" ></text>
+</g>
+<g >
+<title>Envoy::Server::ListenerManagerImpl::addOrUpdateListener (1 samples, 0.46%)</title><rect x="59.2" y="501" width="5.4" height="15.0" fill="rgb(212,9,46)" rx="2" ry="2" />
+<text  x="62.17" y="511.5" ></text>
+</g>
+<g >
+<title>operator new[] (1 samples, 0.46%)</title><rect x="485.3" y="757" width="5.4" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="488.28" y="767.5" ></text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="299.5" y="645" width="5.5" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="302.54" y="655.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::Filter::decodeHeaders (7 samples, 3.24%)</title><rect x="840.4" y="613" width="38.2" height="15.0" fill="rgb(219,15,1)" rx="2" ry="2" />
+<text  x="843.37" y="623.5" >Env..</text>
+</g>
+<g >
+<title>virtual thunk to Envoy::Server::ListenerImpl::healthCheckFailed (1 samples, 0.46%)</title><rect x="605.5" y="581" width="5.4" height="15.0" fill="rgb(227,27,19)" rx="2" ry="2" />
+<text  x="608.46" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Wasm::allocMemory (1 samples, 0.46%)</title><rect x="889.5" y="485" width="5.5" height="15.0" fill="rgb(234,56,45)" rx="2" ry="2" />
+<text  x="892.54" y="495.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::RouteEntryImplBase::corsPolicy (1 samples, 0.46%)</title><rect x="878.6" y="613" width="5.5" height="15.0" fill="rgb(212,198,44)" rx="2" ry="2" />
+<text  x="881.61" y="623.5" ></text>
+</g>
+<g >
+<title>evthread_posix_lock (1 samples, 0.46%)</title><rect x="1080.7" y="725" width="5.5" height="15.0" fill="rgb(242,138,4)" rx="2" ry="2" />
+<text  x="1083.74" y="735.5" ></text>
+</g>
+<g >
+<title>[unknown] (20 samples, 9.26%)</title><rect x="10.0" y="901" width="109.3" height="15.0" fill="rgb(212,179,10)" rx="2" ry="2" />
+<text  x="13.00" y="911.5" >[unknown]</text>
+</g>
+<g >
+<title>absl::hash_internal::CityHash64 (1 samples, 0.46%)</title><rect x="944.2" y="501" width="5.4" height="15.0" fill="rgb(210,59,38)" rx="2" ry="2" />
+<text  x="947.17" y="511.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::onMessageCompleteBase (1 samples, 0.46%)</title><rect x="731.1" y="677" width="5.5" height="15.0" fill="rgb(247,58,2)" rx="2" ry="2" />
+<text  x="734.11" y="687.5" ></text>
+</g>
+<g >
+<title>Envoy::Network::FilterManagerImpl::onRead (1 samples, 0.46%)</title><rect x="1151.8" y="789" width="5.4" height="15.0" fill="rgb(224,85,10)" rx="2" ry="2" />
+<text  x="1154.76" y="799.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::TransportSockets::Tls::SslSocketInfo::subjectPeerCertificate (1 samples, 0.46%)</title><rect x="1020.6" y="597" width="5.5" height="15.0" fill="rgb(248,109,6)" rx="2" ry="2" />
+<text  x="1023.65" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Network::ConnectionImpl::onReadReady (6 samples, 2.78%)</title><rect x="59.2" y="757" width="32.7" height="15.0" fill="rgb(250,132,23)" rx="2" ry="2" />
+<text  x="62.17" y="767.5" >En..</text>
+</g>
+<g >
+<title>google::protobuf::internal::ArenaImpl::Init (1 samples, 0.46%)</title><rect x="305.0" y="629" width="5.5" height="15.0" fill="rgb(246,80,33)" rx="2" ry="2" />
+<text  x="308.00" y="639.5" ></text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::Print (1 samples, 0.46%)</title><rect x="59.2" y="357" width="5.4" height="15.0" fill="rgb(238,206,35)" rx="2" ry="2" />
+<text  x="62.17" y="367.5" ></text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="523.5" y="533" width="5.5" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="526.52" y="543.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Tracers::Zipkin::ReporterImpl::flushSpans (2 samples, 0.93%)</title><rect x="1157.2" y="805" width="10.9" height="15.0" fill="rgb(212,17,28)" rx="2" ry="2" />
+<text  x="1160.22" y="815.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::DebugConfig::key (1 samples, 0.46%)</title><rect x="851.3" y="597" width="5.5" height="15.0" fill="rgb(222,135,7)" rx="2" ry="2" />
+<text  x="854.30" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStreamFilterBase::commonHandleAfterDataCallback (1 samples, 0.46%)</title><rect x="731.1" y="613" width="5.5" height="15.0" fill="rgb(206,146,3)" rx="2" ry="2" />
+<text  x="734.11" y="623.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::decodeData (1 samples, 0.46%)</title><rect x="731.1" y="629" width="5.5" height="15.0" fill="rgb(235,192,15)" rx="2" ry="2" />
+<text  x="734.11" y="639.5" ></text>
+</g>
+<g >
+<title>http_parser_execute (25 samples, 11.57%)</title><rect x="490.7" y="693" width="136.6" height="15.0" fill="rgb(227,174,39)" rx="2" ry="2" />
+<text  x="493.74" y="703.5" >http_parser_execute</text>
+</g>
+<g >
+<title>Envoy::MainCommonBase::run (9 samples, 4.17%)</title><rect x="48.2" y="853" width="49.2" height="15.0" fill="rgb(217,33,31)" rx="2" ry="2" />
+<text  x="51.24" y="863.5" >Envo..</text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::createFilterChain (5 samples, 2.31%)</title><rect x="736.6" y="629" width="27.3" height="15.0" fill="rgb(213,215,47)" rx="2" ry="2" />
+<text  x="739.57" y="639.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Http::HeaderMapImpl::byteSize (1 samples, 0.46%)</title><rect x="490.7" y="661" width="5.5" height="15.0" fill="rgb(239,136,44)" rx="2" ry="2" />
+<text  x="493.74" y="671.5" ></text>
+</g>
+<g >
+<title>Envoy::StreamInfo::StreamInfoImpl::~StreamInfoImpl (2 samples, 0.93%)</title><rect x="529.0" y="533" width="10.9" height="15.0" fill="rgb(234,173,53)" rx="2" ry="2" />
+<text  x="531.98" y="543.5" ></text>
+</g>
+<g >
+<title>std::__1::__function::__func&lt;Envoy::Extensions::HttpFilters::HealthCheck::HealthCheckFilterConfig::createFilterFactoryFromProtoTyped (1 samples, 0.46%)</title><rect x="747.5" y="597" width="5.5" height="15.0" fill="rgb(242,208,14)" rx="2" ry="2" />
+<text  x="750.50" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Tracers::Zipkin::Driver::startSpan (2 samples, 0.93%)</title><rect x="987.9" y="597" width="10.9" height="15.0" fill="rgb(211,216,15)" rx="2" ry="2" />
+<text  x="990.87" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Buffer::WatermarkBuffer::~WatermarkBuffer (1 samples, 0.46%)</title><rect x="195.7" y="789" width="5.5" height="15.0" fill="rgb(208,46,47)" rx="2" ry="2" />
+<text  x="198.74" y="799.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::Filter::getConnPool (2 samples, 0.93%)</title><rect x="862.2" y="597" width="10.9" height="15.0" fill="rgb(234,145,5)" rx="2" ry="2" />
+<text  x="865.22" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::ThreadLocal::InstanceImpl::SlotImpl::get (1 samples, 0.46%)</title><rect x="987.9" y="549" width="5.4" height="15.0" fill="rgb(208,199,20)" rx="2" ry="2" />
+<text  x="990.87" y="559.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Null::Plugin::Stats::IstioDimensions::map_node (2 samples, 0.93%)</title><rect x="228.5" y="709" width="10.9" height="15.0" fill="rgb(229,209,29)" rx="2" ry="2" />
+<text  x="231.52" y="719.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::RouteMatcher::route (2 samples, 0.93%)</title><rect x="960.6" y="597" width="10.9" height="15.0" fill="rgb(227,133,34)" rx="2" ry="2" />
+<text  x="963.56" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::$_7::__invoke (2 samples, 0.93%)</title><rect x="496.2" y="677" width="10.9" height="15.0" fill="rgb(205,82,36)" rx="2" ry="2" />
+<text  x="499.20" y="687.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::StreamEncoderImpl::StreamEncoderImpl (1 samples, 0.46%)</title><rect x="681.9" y="661" width="5.5" height="15.0" fill="rgb(248,107,18)" rx="2" ry="2" />
+<text  x="684.94" y="671.5" ></text>
+</g>
+<g >
+<title>non-virtual thunk to Envoy::Router::PrefixRouteEntryImpl::matches (1 samples, 0.46%)</title><rect x="966.0" y="581" width="5.5" height="15.0" fill="rgb(233,46,51)" rx="2" ry="2" />
+<text  x="969.02" y="591.5" ></text>
+</g>
+<g >
+<title>std::__1::__function::__func&lt;Envoy::Extensions::Common::Wasm::Null::NullPlugin::getFunction (26 samples, 12.04%)</title><rect x="217.6" y="741" width="142.0" height="15.0" fill="rgb(237,150,51)" rx="2" ry="2" />
+<text  x="220.59" y="751.5" >std::__1::__functi..</text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ClientConnectionImpl::onHeadersComplete (15 samples, 6.94%)</title><rect x="545.4" y="661" width="81.9" height="15.0" fill="rgb(205,180,4)" rx="2" ry="2" />
+<text  x="548.37" y="671.5" >Envoy::Ht..</text>
+</g>
+<g >
+<title>Envoy::Event::DispatcherImpl::clearDeferredDeleteList (1 samples, 0.46%)</title><rect x="53.7" y="789" width="5.5" height="15.0" fill="rgb(241,95,48)" rx="2" ry="2" />
+<text  x="56.70" y="799.5" ></text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="1146.3" y="757" width="5.5" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="1149.30" y="767.5" ></text>
+</g>
+<g >
+<title>google::protobuf::DynamicMessageFactory::GetPrototypeNoLock (1 samples, 0.46%)</title><rect x="59.2" y="53" width="5.4" height="15.0" fill="rgb(216,214,50)" rx="2" ry="2" />
+<text  x="62.17" y="63.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::refreshCachedRoute (5 samples, 2.31%)</title><rect x="960.6" y="629" width="27.3" height="15.0" fill="rgb(247,127,30)" rx="2" ry="2" />
+<text  x="963.56" y="639.5" >E..</text>
+</g>
+<g >
+<title>Envoy::StreamInfo::FilterStateImpl::FilterStateImpl (1 samples, 0.46%)</title><rect x="856.8" y="501" width="5.4" height="15.0" fill="rgb(239,191,3)" rx="2" ry="2" />
+<text  x="859.76" y="511.5" ></text>
+</g>
+<g >
+<title>std::__1::__function::__func&lt;Envoy::Extensions::Common::Wasm::Null::NullPlugin::getFunction (4 samples, 1.85%)</title><rect x="578.1" y="565" width="21.9" height="15.0" fill="rgb(237,150,51)" rx="2" ry="2" />
+<text  x="581.15" y="575.5" >s..</text>
+</g>
+<g >
+<title>Envoy::Buffer::WatermarkBuffer::move (1 samples, 0.46%)</title><rect x="1091.7" y="709" width="5.4" height="15.0" fill="rgb(229,219,46)" rx="2" ry="2" />
+<text  x="1094.67" y="719.5" ></text>
+</g>
+<g >
+<title>bssl::ssl3_open_app_data (1 samples, 0.46%)</title><rect x="452.5" y="725" width="5.5" height="15.0" fill="rgb(228,145,12)" rx="2" ry="2" />
+<text  x="455.50" y="735.5" ></text>
+</g>
+<g >
+<title>absl::container_internal::raw_hash_set&lt;absl::container_internal::FlatHashSetPolicy&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;, absl::container_internal::StringHash, absl::container_internal::StringHashEq::Eq, std::__1::allocator&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt; &gt;::find&lt;absl::string_view&gt; (1 samples, 0.46%)</title><rect x="1048.0" y="613" width="5.4" height="15.0" fill="rgb(235,111,54)" rx="2" ry="2" />
+<text  x="1050.96" y="623.5" ></text>
+</g>
+<g >
+<title>google::protobuf::DynamicMessage::CrossLinkPrototypes (1 samples, 0.46%)</title><rect x="59.2" y="101" width="5.4" height="15.0" fill="rgb(250,33,4)" rx="2" ry="2" />
+<text  x="62.17" y="111.5" ></text>
+</g>
+<g >
+<title>Envoy::Grpc::AsyncStreamImpl::onData (2 samples, 0.93%)</title><rect x="59.2" y="597" width="10.9" height="15.0" fill="rgb(210,146,25)" rx="2" ry="2" />
+<text  x="62.17" y="607.5" ></text>
+</g>
+<g >
+<title>Envoy::Event::DispatcherImpl::clearDeferredDeleteList (43 samples, 19.91%)</title><rect x="190.3" y="821" width="234.9" height="15.0" fill="rgb(241,95,48)" rx="2" ry="2" />
+<text  x="193.28" y="831.5" >Envoy::Event::DispatcherImpl::c..</text>
+</g>
+<g >
+<title>google::protobuf::util::BinaryToJsonStream (1 samples, 0.46%)</title><rect x="1157.2" y="757" width="5.5" height="15.0" fill="rgb(242,146,50)" rx="2" ry="2" />
+<text  x="1160.22" y="767.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnPoolImpl::host (3 samples, 1.39%)</title><rect x="780.3" y="613" width="16.4" height="15.0" fill="rgb(246,3,44)" rx="2" ry="2" />
+<text  x="783.28" y="623.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::~ActiveStream (41 samples, 18.98%)</title><rect x="201.2" y="789" width="224.0" height="15.0" fill="rgb(244,133,45)" rx="2" ry="2" />
+<text  x="204.20" y="799.5" >Envoy::Http::ConnectionManage..</text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="993.3" y="581" width="5.5" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="996.33" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::CodecClient::onData (26 samples, 12.04%)</title><rect x="490.7" y="741" width="142.1" height="15.0" fill="rgb(225,42,23)" rx="2" ry="2" />
+<text  x="493.74" y="751.5" >Envoy::Http::Codec..</text>
+</g>
+<g >
+<title>google::protobuf::util::MessageToJsonString (1 samples, 0.46%)</title><rect x="1157.2" y="773" width="5.5" height="15.0" fill="rgb(224,11,7)" rx="2" ry="2" />
+<text  x="1160.22" y="783.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::AsyncRequestImpl::initialize (1 samples, 0.46%)</title><rect x="1162.7" y="773" width="5.4" height="15.0" fill="rgb(220,175,50)" rx="2" ry="2" />
+<text  x="1165.69" y="783.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::dispatchSlice (25 samples, 11.57%)</title><rect x="490.7" y="709" width="136.6" height="15.0" fill="rgb(206,157,34)" rx="2" ry="2" />
+<text  x="493.74" y="719.5" >Envoy::Http::Http..</text>
+</g>
+<g >
+<title>Envoy::Event::DispatcherImpl::deferredDelete (1 samples, 0.46%)</title><rect x="507.1" y="581" width="5.5" height="15.0" fill="rgb(220,72,3)" rx="2" ry="2" />
+<text  x="510.13" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Upstream::EdfLoadBalancerBase::chooseHostOnce (1 samples, 0.46%)</title><rect x="867.7" y="549" width="5.4" height="15.0" fill="rgb(247,122,22)" rx="2" ry="2" />
+<text  x="870.69" y="559.5" ></text>
+</g>
+<g >
+<title>operator new[] (2 samples, 0.93%)</title><rect x="753.0" y="581" width="10.9" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="755.96" y="591.5" ></text>
+</g>
+<g >
+<title>std::__1::__hash_table&lt;std::__1::__hash_value_type&lt;long, std::__1::unique_ptr&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase, std::__1::default_delete&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase&gt; &gt; &gt;, std::__1::__unordered_map_hasher&lt;long, std::__1::__hash_value_type&lt;long, std::__1::unique_ptr&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase, std::__1::default_delete&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase&gt; &gt; &gt;, std::__1::hash&lt;long&gt;, true&gt;, std::__1::__unordered_map_equal&lt;long, std::__1::__hash_value_type&lt;long, std::__1::unique_ptr&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase, std::__1::default_delete&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase&gt; &gt; &gt;, std::__1::equal_to&lt;long&gt;, true&gt;, std::__1::allocator&lt;std::__1::__hash_value_type&lt;long, std::__1::unique_ptr&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase, std::__1::default_delete&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::ContextBase&gt; &gt; &gt; &gt; &gt;::__emplace_unique_impl&lt;std::__1::pair&lt;unsigned long, decltype (1 samples, 0.46%)</title><rect x="895.0" y="533" width="5.5" height="15.0" fill="rgb(214,22,44)" rx="2" ry="2" />
+<text  x="898.00" y="543.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::encodeHeaders (9 samples, 4.17%)</title><rect x="561.8" y="613" width="49.1" height="15.0" fill="rgb(253,36,27)" rx="2" ry="2" />
+<text  x="564.76" y="623.5" >Envo..</text>
+</g>
+<g >
+<title>google::protobuf::Map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, google::protobuf::Value&gt;::~Map (2 samples, 0.93%)</title><rect x="381.5" y="709" width="10.9" height="15.0" fill="rgb(215,105,34)" rx="2" ry="2" />
+<text  x="384.48" y="719.5" ></text>
+</g>
+<g >
+<title>virtual thunk to Envoy::Extensions::Common::Wasm::Context::encodeHeaders (5 samples, 2.31%)</title><rect x="578.1" y="597" width="27.4" height="15.0" fill="rgb(214,214,11)" rx="2" ry="2" />
+<text  x="581.15" y="607.5" >v..</text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::getProperty (4 samples, 1.85%)</title><rect x="288.6" y="661" width="21.9" height="15.0" fill="rgb(215,195,21)" rx="2" ry="2" />
+<text  x="291.61" y="671.5" >E..</text>
+</g>
+<g >
+<title>google::protobuf::DynamicMessageFactory::GetPrototypeNoLock (1 samples, 0.46%)</title><rect x="59.2" y="117" width="5.4" height="15.0" fill="rgb(216,214,50)" rx="2" ry="2" />
+<text  x="62.17" y="127.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::onLog (27 samples, 12.50%)</title><rect x="212.1" y="757" width="147.5" height="15.0" fill="rgb(228,53,32)" rx="2" ry="2" />
+<text  x="215.13" y="767.5" >Envoy::Extensions:..</text>
+</g>
+<g >
+<title>Envoy::Utils::Authentication::SaveAuthAttributesToStruct (1 samples, 0.46%)</title><rect x="818.5" y="597" width="5.5" height="15.0" fill="rgb(206,218,3)" rx="2" ry="2" />
+<text  x="821.52" y="607.5" ></text>
+</g>
+<g >
+<title>absl::container_internal::raw_hash_map&lt;absl::container_internal::FlatHashMapPolicy&lt;unsigned long, Envoy::Stats::ThreadLocalStoreImpl::TlsCacheEntry&gt;, absl::hash_internal::Hash&lt;unsigned long&gt;, std::__1::equal_to&lt;unsigned long&gt;, std::__1::allocator&lt;std::__1::pair&lt;unsigned long const, Envoy::Stats::ThreadLocalStoreImpl::TlsCacheEntry&gt; &gt; &gt;::try_emplace_impl&lt;unsigned long const&amp;&gt; (1 samples, 0.46%)</title><rect x="621.9" y="549" width="5.4" height="15.0" fill="rgb(227,211,53)" rx="2" ry="2" />
+<text  x="624.85" y="559.5" ></text>
+</g>
+<g >
+<title>Envoy::Network::ConnectionImpl::readDisable (4 samples, 1.85%)</title><rect x="1064.4" y="741" width="21.8" height="15.0" fill="rgb(249,8,10)" rx="2" ry="2" />
+<text  x="1067.35" y="751.5" >E..</text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="927.8" y="517" width="5.4" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="930.78" y="527.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::onCreate (5 samples, 2.31%)</title><rect x="884.1" y="581" width="27.3" height="15.0" fill="rgb(222,124,13)" rx="2" ry="2" />
+<text  x="887.07" y="591.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::ActiveStream (2 samples, 0.93%)</title><rect x="665.6" y="629" width="10.9" height="15.0" fill="rgb(237,212,31)" rx="2" ry="2" />
+<text  x="668.56" y="639.5" ></text>
+</g>
+<g >
+<title>operator new[] (1 samples, 0.46%)</title><rect x="572.7" y="565" width="5.4" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="575.69" y="575.5" ></text>
+</g>
+<g >
+<title>evmap_io_active_ (4 samples, 1.85%)</title><rect x="163.0" y="821" width="21.8" height="15.0" fill="rgb(250,208,19)" rx="2" ry="2" />
+<text  x="165.96" y="831.5" >e..</text>
+</g>
+<g >
+<title>Envoy::AccessLog::StreamInfoFormatter::format (1 samples, 0.46%)</title><rect x="53.7" y="709" width="5.5" height="15.0" fill="rgb(222,169,42)" rx="2" ry="2" />
+<text  x="56.70" y="719.5" ></text>
+</g>
+<g >
+<title>__clock_gettime (1 samples, 0.46%)</title><rect x="146.6" y="837" width="5.4" height="15.0" fill="rgb(219,172,40)" rx="2" ry="2" />
+<text  x="149.57" y="847.5" ></text>
+</g>
+<g >
+<title>X509_up_ref (1 samples, 0.46%)</title><rect x="294.1" y="597" width="5.4" height="15.0" fill="rgb(251,146,10)" rx="2" ry="2" />
+<text  x="297.07" y="607.5" ></text>
+</g>
+<g >
+<title>aead_aes_gcm_open_gather (2 samples, 0.93%)</title><rect x="468.9" y="645" width="10.9" height="15.0" fill="rgb(237,154,7)" rx="2" ry="2" />
+<text  x="471.89" y="655.5" ></text>
+</g>
+<g >
+<title>google::protobuf::DynamicMessage::CrossLinkPrototypes (1 samples, 0.46%)</title><rect x="59.2" y="165" width="5.4" height="15.0" fill="rgb(250,33,4)" rx="2" ry="2" />
+<text  x="62.17" y="175.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::dispatch (26 samples, 12.04%)</title><rect x="490.7" y="725" width="142.1" height="15.0" fill="rgb(244,216,42)" rx="2" ry="2" />
+<text  x="493.74" y="735.5" >Envoy::Http::Http1..</text>
+</g>
+<g >
+<title>absl::container_internal::raw_hash_set&lt;absl::container_internal::FlatHashMapPolicy&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::unique_ptr&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject, std::__1::default_delete&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject&gt; &gt; &gt;, absl::container_internal::StringHash, absl::container_internal::StringHashEq::Eq, std::__1::allocator&lt;std::__1::pair&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; const, std::__1::unique_ptr&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject, std::__1::default_delete&lt;Envoy::StreamInfo::FilterStateImpl::FilterObject&gt; &gt; &gt; &gt; &gt;::find_or_prepare_insert&lt;absl::string_view&gt; (2 samples, 0.93%)</title><rect x="933.2" y="485" width="11.0" height="15.0" fill="rgb(223,93,52)" rx="2" ry="2" />
+<text  x="936.24" y="495.5" ></text>
+</g>
+<g >
+<title>epoll_ctl (1 samples, 0.46%)</title><rect x="1075.3" y="645" width="5.4" height="15.0" fill="rgb(221,161,52)" rx="2" ry="2" />
+<text  x="1078.28" y="655.5" ></text>
+</g>
+<g >
+<title>operator delete[] (1 samples, 0.46%)</title><rect x="1037.0" y="613" width="5.5" height="15.0" fill="rgb(247,31,0)" rx="2" ry="2" />
+<text  x="1040.04" y="623.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Exports::get_header_map_value (1 samples, 0.46%)</title><rect x="922.3" y="549" width="5.5" height="15.0" fill="rgb(229,198,49)" rx="2" ry="2" />
+<text  x="925.31" y="559.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Filters::Common::Expr::RequestWrapper::operator[] (1 samples, 0.46%)</title><rect x="315.9" y="629" width="5.5" height="15.0" fill="rgb(222,134,22)" rx="2" ry="2" />
+<text  x="318.93" y="639.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http2::ConnectionImpl::onFrameReceived (2 samples, 0.93%)</title><rect x="59.2" y="645" width="10.9" height="15.0" fill="rgb(240,198,14)" rx="2" ry="2" />
+<text  x="62.17" y="655.5" ></text>
+</g>
+<g >
+<title>Envoy::Server::PrometheusStatsFormatter::statsAsPrometheus (1 samples, 0.46%)</title><rect x="70.1" y="517" width="5.5" height="15.0" fill="rgb(216,3,10)" rx="2" ry="2" />
+<text  x="73.09" y="527.5" ></text>
+</g>
+<g >
+<title>Envoy::TcpProxy::Filter::onUpstreamData (1 samples, 0.46%)</title><rect x="1091.7" y="741" width="5.4" height="15.0" fill="rgb(211,58,28)" rx="2" ry="2" />
+<text  x="1094.67" y="751.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::$_2::__invoke (4 samples, 1.85%)</title><rect x="665.6" y="693" width="21.8" height="15.0" fill="rgb(224,84,23)" rx="2" ry="2" />
+<text  x="668.56" y="703.5" >E..</text>
+</g>
+<g >
+<title>operator new[] (1 samples, 0.46%)</title><rect x="813.1" y="581" width="5.4" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="816.06" y="591.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 samples, 0.46%)</title><rect x="10.0" y="837" width="5.5" height="15.0" fill="rgb(212,179,10)" rx="2" ry="2" />
+<text  x="13.00" y="847.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Null::Plugin::Stats::PluginRootContext::report (25 samples, 11.57%)</title><rect x="217.6" y="725" width="136.6" height="15.0" fill="rgb(213,209,35)" rx="2" ry="2" />
+<text  x="220.59" y="735.5" >Envoy::Extensions..</text>
+</g>
+<g >
+<title>__cxxabiv1::__vmi_class_type_info::~__vmi_class_type_info (1 samples, 0.46%)</title><rect x="26.4" y="885" width="5.5" height="15.0" fill="rgb(219,63,40)" rx="2" ry="2" />
+<text  x="29.39" y="895.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Null::NullPlugin::ensureContext (3 samples, 1.39%)</title><rect x="889.5" y="549" width="16.4" height="15.0" fill="rgb(208,103,24)" rx="2" ry="2" />
+<text  x="892.54" y="559.5" ></text>
+</g>
+<g >
+<title>epoll_nochangelist_del (1 samples, 0.46%)</title><rect x="1075.3" y="661" width="5.4" height="15.0" fill="rgb(241,115,6)" rx="2" ry="2" />
+<text  x="1078.28" y="671.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::log (27 samples, 12.50%)</title><rect x="212.1" y="773" width="147.5" height="15.0" fill="rgb(223,201,27)" rx="2" ry="2" />
+<text  x="215.13" y="783.5" >Envoy::Extensions:..</text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::~Context (1 samples, 0.46%)</title><rect x="370.6" y="757" width="5.4" height="15.0" fill="rgb(205,23,7)" rx="2" ry="2" />
+<text  x="373.56" y="767.5" ></text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="1053.4" y="629" width="5.5" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="1056.43" y="639.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Null::Plugin::Context::asContext (2 samples, 0.93%)</title><rect x="578.1" y="549" width="11.0" height="15.0" fill="rgb(222,143,42)" rx="2" ry="2" />
+<text  x="581.15" y="559.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::Filter::UpstreamRequest::decodeHeaders (13 samples, 6.02%)</title><rect x="556.3" y="645" width="71.0" height="15.0" fill="rgb(229,140,48)" rx="2" ry="2" />
+<text  x="559.30" y="655.5" >Envoy::R..</text>
+</g>
+<g >
+<title>google::protobuf::Map&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt;, std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt;::operator[] (1 samples, 0.46%)</title><rect x="234.0" y="677" width="5.4" height="15.0" fill="rgb(214,156,11)" rx="2" ry="2" />
+<text  x="236.98" y="687.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Exports::get_property (1 samples, 0.46%)</title><rect x="889.5" y="501" width="5.5" height="15.0" fill="rgb(227,14,17)" rx="2" ry="2" />
+<text  x="892.54" y="511.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Filters::Common::Expr::ConnectionWrapper::operator[] (2 samples, 0.93%)</title><rect x="288.6" y="645" width="10.9" height="15.0" fill="rgb(208,61,1)" rx="2" ry="2" />
+<text  x="291.61" y="655.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::dispatchSlice (4 samples, 1.85%)</title><rect x="70.1" y="693" width="21.8" height="15.0" fill="rgb(206,157,34)" rx="2" ry="2" />
+<text  x="73.09" y="703.5" >E..</text>
+</g>
+<g >
+<title>__pthread_mutex_lock (1 samples, 0.46%)</title><rect x="152.0" y="837" width="5.5" height="15.0" fill="rgb(229,119,25)" rx="2" ry="2" />
+<text  x="155.04" y="847.5" ></text>
+</g>
+<g >
+<title>Envoy::StreamInfo::StreamInfoImpl::setDynamicMetadata (4 samples, 1.85%)</title><rect x="796.7" y="597" width="21.8" height="15.0" fill="rgb(242,16,18)" rx="2" ry="2" />
+<text  x="799.67" y="607.5" >E..</text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Null::Plugin::getValue&lt;std::__1::basic_string&lt;char, std::__1::char_traits&lt;char&gt;, std::__1::allocator&lt;char&gt; &gt; &gt; (3 samples, 1.39%)</title><rect x="255.8" y="693" width="16.4" height="15.0" fill="rgb(214,42,6)" rx="2" ry="2" />
+<text  x="258.83" y="703.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Context::getHeaderMapValue (1 samples, 0.46%)</title><rect x="589.1" y="517" width="5.4" height="15.0" fill="rgb(242,200,48)" rx="2" ry="2" />
+<text  x="592.07" y="527.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::ConnectionManagerImpl::ActiveStream::~ActiveStream (1 samples, 0.46%)</title><rect x="53.7" y="773" width="5.5" height="15.0" fill="rgb(244,133,45)" rx="2" ry="2" />
+<text  x="56.70" y="783.5" ></text>
+</g>
+<g >
+<title>SSL_write (2 samples, 0.93%)</title><rect x="1135.4" y="757" width="10.9" height="15.0" fill="rgb(218,153,20)" rx="2" ry="2" />
+<text  x="1138.37" y="767.5" ></text>
+</g>
+<g >
+<title>std::__1::__function::__func&lt;Envoy::Extensions::Wasm::MetadataExchange::Plugin::$_0, std::__1::allocator&lt;Envoy::Extensions::Wasm::MetadataExchange::Plugin::$_0&gt;, std::__1::unique_ptr&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::Context, std::__1::default_delete&lt;Envoy::Extensions::Common::Wasm::Null::Plugin::Context&gt; &gt;  (1 samples, 0.46%)</title><rect x="889.5" y="533" width="5.5" height="15.0" fill="rgb(224,15,4)" rx="2" ry="2" />
+<text  x="892.54" y="543.5" ></text>
+</g>
+<g >
+<title>google::protobuf::TextFormat::Printer::Print (1 samples, 0.46%)</title><rect x="59.2" y="293" width="5.4" height="15.0" fill="rgb(238,206,35)" rx="2" ry="2" />
+<text  x="62.17" y="303.5" ></text>
+</g>
+<g >
+<title>[envoy] (1 samples, 0.46%)</title><rect x="294.1" y="565" width="5.4" height="15.0" fill="rgb(208,42,11)" rx="2" ry="2" />
+<text  x="297.07" y="575.5" ></text>
+</g>
+<g >
+<title>bssl::ssl_read_buffer_extend_to (1 samples, 0.46%)</title><rect x="479.8" y="693" width="5.5" height="15.0" fill="rgb(221,19,14)" rx="2" ry="2" />
+<text  x="482.81" y="703.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::TransportSockets::Tls::SslSocketInfo::peerCertificatePresented (2 samples, 0.93%)</title><rect x="288.6" y="629" width="10.9" height="15.0" fill="rgb(219,188,29)" rx="2" ry="2" />
+<text  x="291.61" y="639.5" ></text>
+</g>
+<g >
+<title>std::__1::__function::__func&lt;Envoy::Server::WatchDogImpl::startWatchdog (1 samples, 0.46%)</title><rect x="91.9" y="789" width="5.5" height="15.0" fill="rgb(217,130,25)" rx="2" ry="2" />
+<text  x="94.94" y="799.5" ></text>
+</g>
+<g >
+<title>nghttp2_session_mem_recv (2 samples, 0.93%)</title><rect x="59.2" y="677" width="10.9" height="15.0" fill="rgb(231,27,22)" rx="2" ry="2" />
+<text  x="62.17" y="687.5" ></text>
+</g>
+<g >
+<title>Envoy::StreamInfo::ResponseFlagUtils::toShortString (1 samples, 0.46%)</title><rect x="408.8" y="757" width="5.5" height="15.0" fill="rgb(208,101,46)" rx="2" ry="2" />
+<text  x="411.80" y="767.5" ></text>
+</g>
+<g >
+<title>google::protobuf::Struct::MergeFrom (3 samples, 1.39%)</title><rect x="796.7" y="581" width="16.4" height="15.0" fill="rgb(241,179,17)" rx="2" ry="2" />
+<text  x="799.67" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Router::Filter::UpstreamRequest::decodeData (2 samples, 0.93%)</title><rect x="59.2" y="629" width="10.9" height="15.0" fill="rgb(217,168,4)" rx="2" ry="2" />
+<text  x="62.17" y="639.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::CodecClient::CodecReadFilter::onData (26 samples, 12.04%)</title><rect x="490.7" y="757" width="142.1" height="15.0" fill="rgb(221,89,15)" rx="2" ry="2" />
+<text  x="493.74" y="767.5" >Envoy::Http::Codec..</text>
+</g>
+<g >
+<title>std::__1::__function::__func&lt;Envoy::Network::ConnectionImpl::ConnectionImpl (2 samples, 0.93%)</title><rect x="1168.1" y="821" width="11.0" height="15.0" fill="rgb(232,104,34)" rx="2" ry="2" />
+<text  x="1171.15" y="831.5" ></text>
+</g>
+<g >
+<title>SSL_max_seal_overhead (1 samples, 0.46%)</title><rect x="1135.4" y="709" width="5.4" height="15.0" fill="rgb(212,46,17)" rx="2" ry="2" />
+<text  x="1138.37" y="719.5" ></text>
+</g>
+<g >
+<title>google::protobuf::internal::ArenaImpl::SerialArena::AllocateAlignedFallback (1 samples, 0.46%)</title><rect x="310.5" y="581" width="5.4" height="15.0" fill="rgb(218,170,21)" rx="2" ry="2" />
+<text  x="313.46" y="591.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::WasmStateWrapper::operator[] (2 samples, 0.93%)</title><rect x="261.3" y="645" width="10.9" height="15.0" fill="rgb(218,46,44)" rx="2" ry="2" />
+<text  x="264.30" y="655.5" ></text>
+</g>
+<g >
+<title>aes_hw_ctr32_encrypt_blocks (1 samples, 0.46%)</title><rect x="468.9" y="629" width="5.5" height="15.0" fill="rgb(220,200,12)" rx="2" ry="2" />
+<text  x="471.89" y="639.5" ></text>
+</g>
+<g >
+<title>Envoy::StreamInfo::StreamInfoImpl::~StreamInfoImpl (3 samples, 1.39%)</title><rect x="381.5" y="773" width="16.4" height="15.0" fill="rgb(234,173,53)" rx="2" ry="2" />
+<text  x="384.48" y="783.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::$_5::__invoke (1 samples, 0.46%)</title><rect x="490.7" y="677" width="5.5" height="15.0" fill="rgb(222,2,1)" rx="2" ry="2" />
+<text  x="493.74" y="687.5" ></text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="873.1" y="597" width="5.5" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="876.15" y="607.5" ></text>
+</g>
+<g >
+<title>google::protobuf::internal::ArenaImpl::AllocateAlignedAndAddCleanupFallback (1 samples, 0.46%)</title><rect x="310.5" y="613" width="5.4" height="15.0" fill="rgb(222,108,1)" rx="2" ry="2" />
+<text  x="313.46" y="623.5" ></text>
+</g>
+<g >
+<title>Envoy::Extensions::Common::Wasm::Null::NullVm::getMemory (1 samples, 0.46%)</title><rect x="594.5" y="533" width="5.5" height="15.0" fill="rgb(219,217,30)" rx="2" ry="2" />
+<text  x="597.54" y="543.5" ></text>
+</g>
+<g >
+<title>[libc-2.27.so] (1 samples, 0.46%)</title><rect x="354.2" y="725" width="5.4" height="15.0" fill="rgb(254,66,50)" rx="2" ry="2" />
+<text  x="357.17" y="735.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::CodeStatsImpl::chargeResponseStat (2 samples, 0.93%)</title><rect x="616.4" y="597" width="10.9" height="15.0" fill="rgb(205,167,29)" rx="2" ry="2" />
+<text  x="619.39" y="607.5" ></text>
+</g>
+<g >
+<title>google::protobuf::DynamicMessage::CrossLinkPrototypes (1 samples, 0.46%)</title><rect x="59.2" y="69" width="5.4" height="15.0" fill="rgb(250,33,4)" rx="2" ry="2" />
+<text  x="62.17" y="79.5" ></text>
+</g>
+<g >
+<title>operator new[] (1 samples, 0.46%)</title><rect x="824.0" y="581" width="5.4" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="826.98" y="591.5" ></text>
+</g>
+<g >
+<title>absl::container_internal::raw_hash_set&lt;absl::container_internal::FlatHashMapPolicy&lt;std::__1::vector&lt;unsigned char, std::__1::allocator&lt;unsigned char&gt; &gt;, std::__1::unique_ptr&lt;Envoy::Http::ConnectionPool::Instance, std::__1::default_delete&lt;Envoy::Http::ConnectionPool::Instance&gt; &gt; &gt;, absl::hash_internal::Hash&lt;std::__1::vector&lt;unsigned char, std::__1::allocator&lt;unsigned char&gt; &gt; &gt;, std::__1::equal_to&lt;std::__1::vector&lt;unsigned char, std::__1::allocator&lt;unsigned char&gt; &gt; &gt;, std::__1::allocator&lt;std::__1::pair&lt;std::__1::vector&lt;unsigned char, std::__1::allocator&lt;unsigned char&gt; &gt; const, std::__1::unique_ptr&lt;Envoy::Http::ConnectionPool::Instance, std::__1::default_delete&lt;Envoy::Http::ConnectionPool::Instance&gt; &gt; &gt; &gt; &gt;::find&lt;std::__1::vector&lt;unsigned char, std::__1::allocator&lt;unsigned char&gt; &gt; &gt; (1 samples, 0.46%)</title><rect x="1162.7" y="661" width="5.4" height="15.0" fill="rgb(247,63,39)" rx="2" ry="2" />
+<text  x="1165.69" y="671.5" ></text>
+</g>
+<g >
+<title>operator new[] (1 samples, 0.46%)</title><rect x="856.8" y="469" width="5.4" height="15.0" fill="rgb(212,84,2)" rx="2" ry="2" />
+<text  x="859.76" y="479.5" ></text>
+</g>
+<g >
+<title>Envoy::Http::Http1::ConnectionImpl::onHeadersCompleteBase (60 samples, 27.78%)</title><rect x="736.6" y="693" width="327.8" height="15.0" fill="rgb(242,167,27)" rx="2" ry="2" />
+<text  x="739.57" y="703.5" >Envoy::Http::Http1::ConnectionImpl::onHeader..</text>
+</g>
+</g>
+</svg>
